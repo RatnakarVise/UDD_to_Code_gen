@@ -18,7 +18,6 @@ def generate_abap_code_from_requirement(requirement: str) -> str:
     """
     Generate ABAP code strictly from the requirement, without using any template.
     """
-    print(f"OPENAI_API_KEY: {openai_api_key}")
     prompt_template = ChatPromptTemplate.from_template(
         "You are an expert ABAP developer.\n\n"
         "REQUIREMENT:\n{requirement}\n\n"

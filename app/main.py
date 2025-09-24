@@ -6,12 +6,12 @@ from app.generator import generate_abap_code_from_requirement
 from app.docx_writer import  create_abap_code_docx
 
 class RequirementInput(BaseModel):
-    requirement: str
+    REQUIREMENT: str
 
 app = FastAPI()
 @app.post("/generate-bundle/")
 async def generate_fs_ts_abapcode(input_data: RequirementInput):
-    requirement = input_data.requirement
+    requirement = input_data.REQUIREMENT
 
     abap_code_text = generate_abap_code_from_requirement(requirement)
 
