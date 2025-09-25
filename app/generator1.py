@@ -52,7 +52,7 @@ def split_sections(payload: str) -> Dict[str, str]:
     else:
         raise ValueError("Payload must be a JSON string or dict")
 
-    document = data.get("document", "")
+    document = data.get("REQUIREMENT", "")
     # Regex: capture SECTION header line
     sections = re.split(r"(SECTION:\s*\d+\.\s*[^\d\n]+)", document)
 
@@ -142,8 +142,3 @@ def assemble_program(abap_parts: Dict[str, str]) -> str:
     ])
 
 
-# Example usage:
-# payload = '{"document": "..."}'
-# abap_parts = process_payload_and_generate_abap(payload)
-# final_program = assemble_program(abap_parts)
-# print(final_program)
