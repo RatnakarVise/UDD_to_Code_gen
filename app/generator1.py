@@ -29,9 +29,19 @@ ABAP_SECTIONS = [
 
 DEFAULT_UDD_MAPPING = {
     "selection_screen": ["SECTION: 4. User Interface"],
-    "global_declaration": ["SECTION: 4. User Interface","SECTION: 5. Technical Architecture"],
-    "processing_logic": ["SECTION: 1 Purpose", "SECTION: 2. Scope","SECTION: 3. Functional Requirements","SECTION: 4. User Interface","SECTION: 5. Technical Architecture", "SECTION: 6. Error Handling","SECTION: 7. Performance Notes","SECTION: 8. Authorization", "SECTION: 9. Sample Report Output Layouts","SECTION: 10. Unit Test Plan"],
-    "output_display": ["SECTION: 4. User Interface","SECTION: 5. Technical Architecture", "SECTION: 6. Error Handling","SECTION: 7. Performance Notes","SECTION: 9. Sample Report Output Layouts","SECTION: 10. Unit Test Plan"]
+    "global_declaration": ["SECTION: 4. User Interface", "SECTION: 5. Technical Architecture"],
+    "processing_logic": [
+        "SECTION: 1. Purpose", "SECTION: 2. Scope", "SECTION: 3. Functional Requirements",
+        "SECTION: 4. User Interface", "SECTION: 5. Technical Architecture",
+        "SECTION: 6. Error Handling", "SECTION: 7. Performance Notes",
+        "SECTION: 8. Authorization", "SECTION: 9. Sample Report Output Layouts",
+        "SECTION: 10. Unit Test Plan"
+    ],
+    "output_display": [
+        "SECTION: 4. User Interface", "SECTION: 5. Technical Architecture",
+        "SECTION: 6. Error Handling", "SECTION: 7. Performance Notes",
+        "SECTION: 9. Sample Report Output Layouts", "SECTION: 10. Unit Test Plan"
+    ]
 }
 
 def split_sections(payload: str) -> Dict[str, str]:
@@ -41,9 +51,11 @@ def split_sections(payload: str) -> Dict[str, str]:
         data = payload
     else:
         raise ValueError("Payload must be a JSON string or dict")
-    
+
     document = data.get("document", "")
-    sections = re.split(r"(SECTION:\s*\d+[^\n]*)", document)
+    # Regex: capture SECTION header line
+    sections = re.split(r"(SECTION:\s*\d+\.\s*[^\d\n]+)", document)
+
     result = {}
     current_section = None
     for part in sections:
@@ -51,11 +63,15 @@ def split_sections(payload: str) -> Dict[str, str]:
         if not part:
             continue
         if part.startswith("SECTION:"):
-            current_section = part
-            result[current_section] = ""
+            # normalize: keep only "SECTION: <number>. <title>"
+            match = re.match(r"(SECTION:\s*\d+\.\s*[^\d\n]+)", part)
+            if match:
+                current_section = match.group(1).strip()
+                if current_section not in result:
+                    result[current_section] = ""
         else:
             if current_section:
-                result[current_section] = part.strip()
+                result[current_section] += part.strip() + "\n"
     return result
 
 
