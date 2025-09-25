@@ -158,20 +158,24 @@ def generate_doc(ts_text: str, file_obj: BytesIO, title: str):
 # Public API Functions for FS, TS, ABAP
 # ----------------------------------------
 
-def create_functional_spec_docx(fs_text: str, file_obj: BytesIO):
-    generate_doc(fs_text, file_obj, title="FUNCTIONAL SPECIFICATION")
 
-def create_technical_spec_docx(ts_text: str, file_obj: BytesIO):
-    generate_doc(ts_text, file_obj, title="TECHNICAL SPECIFICATION")
-
-def create_abap_code_docx(abap_code: str, file_obj: BytesIO):
+def create_abap_code_docx(abap_code: dict, file_obj: BytesIO):
     """
     Creates an ABAP code DOCX file in the given file object, using monospaced font.
+    Expects abap_code to be a dict with keys like global_declaration, selection_screen, etc.
     """
     doc = Document()
     doc.add_heading('ABAP Code', level=1)
-    para = doc.add_paragraph()
-    run = para.add_run(abap_code)
-    run.font.name = 'Consolas'  # Monospaced font for code
-    run.font.size = Pt(10.5)
+
+    for section, code in abap_code.items():
+        # Add section as heading
+        doc.add_heading(section.replace("_", " ").title(), level=2)
+
+        # Add the code block with monospaced font
+        para = doc.add_paragraph()
+        run = para.add_run(code)
+        run.font.name = 'Consolas'
+        run.font.size = Pt(10.5)
+
     doc.save(file_obj)
+
