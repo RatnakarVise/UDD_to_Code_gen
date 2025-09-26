@@ -53,8 +53,26 @@ def split_sections(payload: str) -> Dict[str, str]:
         raise ValueError("Payload must be a JSON string or dict")
 
     document = data.get("REQUIREMENT", "")
-    # Regex: capture SECTION header line
-    sections = re.split(r"(SECTION:\s*\d+\.\s*[^\d\n]+)", document)
+
+    # 1️⃣ Ensure SECTION headers always start on a new line
+    document = re.sub(r"(?<!\n)(SECTION\s*:?\s*\d+\.)", r"\n\1", document)
+
+    # 2️⃣ Normalize SECTION header variants (handles SECTION:1. Purpose, SECTION 1. Purpose, etc.)
+    document = re.sub(
+        r"SECTION\s*:?\s*\n*\s*(\d+\.\s+[A-Za-z ]+)",
+        r"SECTION: \1",
+        document
+    )
+
+    # 3️⃣ Ensure newline right after SECTION headers
+    document = re.sub(
+        r"(SECTION:\s*\d+\.\s+[A-Za-z ]+)",
+        r"\1\n",
+        document
+    )
+
+    # 4️⃣ Split into sections
+    sections = re.split(r"(SECTION:\s*\d+\.\s+[A-Za-z ]+)", document)
 
     result = {}
     current_section = None
@@ -63,8 +81,7 @@ def split_sections(payload: str) -> Dict[str, str]:
         if not part:
             continue
         if part.startswith("SECTION:"):
-            # normalize: keep only "SECTION: <number>. <title>"
-            match = re.match(r"(SECTION:\s*\d+\.\s*[^\d\n]+)", part)
+            match = re.match(r"(SECTION:\s*\d+\.\s+[A-Za-z ]+)", part)
             if match:
                 current_section = match.group(1).strip()
                 if current_section not in result:
@@ -132,7 +149,6 @@ Requirements:
     return abap_result
 
 
-
 def assemble_program(abap_parts: Dict[str, str]) -> str:
     return "\n\n".join([
         abap_parts.get("global_declaration", ""),
@@ -140,5 +156,3 @@ def assemble_program(abap_parts: Dict[str, str]) -> str:
         abap_parts.get("processing_logic", ""),
         abap_parts.get("output_display", ""),
     ])
-
-
