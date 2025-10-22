@@ -3,32 +3,34 @@ import uuid
 import io
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
-
-from app.generator1 import process_payload_and_generate_abap
+# from app.generator1 import process_payload_and_generate_abap
+from app.generator1 import generate_full_abap_program
 from app.docx_writer1 import create_abap_code_docx
 
 app = FastAPI(title="ABAP Code Generator")
 
-# In-memory job store (⚠️ not for production)
+# In-memory job store (not for production)
 JOBS = {}
+
 
 def generate_abap_doc_background(payload: dict, job_id: str):
     """
-    Background job: 
+    Background job:
     1. Split payload into sections
     2. Generate ABAP code for each section
     3. Write into DOCX file
     """
     try:
         # Generate ABAP codes for all sections
-        abap_results = process_payload_and_generate_abap(payload)
+        # abap_results = process_payload_and_generate_abap(payload)
+        abap_results = generate_full_abap_program(payload)
 
         # Save ABAP code into DOCX
         output_filename = f"ABAP_Code_{job_id}.docx"
         output_path = os.path.abspath(output_filename)
-
         abap_code_doc = io.BytesIO()
         create_abap_code_docx(abap_results, abap_code_doc)
+
         with open(output_path, "wb") as f:
             f.write(abap_code_doc.getvalue())
 
