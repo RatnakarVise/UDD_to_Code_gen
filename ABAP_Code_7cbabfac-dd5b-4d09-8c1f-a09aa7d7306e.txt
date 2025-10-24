@@ -1,0 +1,368 @@
+REPORT zmm_po_close.
+
+*---------------------------------------------------------------------*
+* Program: ZMM_PO_CLOSE - Utility to close open POs
+* Type   : Executable
+* Output : ALV Grid (SALV) - supports sorting, filtering, subtotalling,
+*          exporting (Excel/PDF), and layout saving
+*---------------------------------------------------------------------*
+* Selection logic:
+* - If material type provided (S_MTART), filter MARA-MTART to get MTART,
+*   then pass to EKPO through join to MARA
+* - If vendor provided (S_LIFNR), filter EKKO-LIFNR and get POs (EBELN)
+* - Filter EKPO using provided/fetched criteria and ELIKZ = space (open)
+* - Display list, allow multi-select and close in bulk (set EKPO-ELIKZ = 'X')
+*---------------------------------------------------------------------*
+* Custom table ZTA_MM_PO (global): MATNR, EBELN, EBELP, BEDAT
+* - Selected via left join to display custom BEDAT alongside EKKO-BEDAT
+*---------------------------------------------------------------------*
+
+TABLES: ekko, ekpo, mara, lfa1.
+
+TYPE-POOLS: abap.
+
+*----------------------------------------------------------------------*
+* Types
+*----------------------------------------------------------------------*
+TYPES: BEGIN OF ty_alv,
+         ebeln      TYPE ekpo-ebeln,
+         ebelp      TYPE ekpo-ebelp,
+         matnr      TYPE ekpo-matnr,
+         werks      TYPE ekpo-werks,
+         mtart      TYPE mara-mtart,
+         lifnr      TYPE ekko-lifnr,
+         name1      TYPE lfa1-name1,
+         elikz      TYPE ekpo-elikz,
+         bedat_ekko TYPE ekko-bedat,
+         bedat_zta  TYPE zta_mm_po-bedat,
+       END OF ty_alv.
+
+*----------------------------------------------------------------------*
+* Data
+*----------------------------------------------------------------------*
+DATA: lt_alv        TYPE STANDARD TABLE OF ty_alv WITH DEFAULT KEY,
+      ls_alv        TYPE ty_alv.
+
+DATA: go_salv       TYPE REF TO cl_salv_table,
+      go_functions  TYPE REF TO cl_salv_functions,
+      go_cols       TYPE REF TO cl_salv_columns_table,
+      go_layout     TYPE REF TO cl_salv_layout,
+      go_sel        TYPE REF TO cl_salv_selections,
+      go_events     TYPE REF TO cl_salv_events_table.
+
+DATA: gv_closed_ok  TYPE i,
+      gv_closed_err TYPE i.
+
+CONSTANTS: gc_func_close TYPE salv_de_function VALUE 'CLOSE'.
+
+*----------------------------------------------------------------------*
+* Selection screen
+*----------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-001.
+SELECT-OPTIONS: s_matnr FOR mara-matnr,
+                s_werks FOR ekpo-werks OBLIGATORY,
+                s_lifnr FOR ekko-lifnr,
+                s_mtart FOR mara-mtart.
+SELECTION-SCREEN END OF BLOCK b1.
+
+*----------------------------------------------------------------------*
+* Texts
+*----------------------------------------------------------------------*
+* TEXT-001: Selection Criteria
+
+*----------------------------------------------------------------------*
+* Local event handler for SALV
+*----------------------------------------------------------------------*
+CLASS lcl_event_handler DEFINITION.
+  PUBLIC SECTION.
+    METHODS:
+      on_added_function FOR EVENT added_function OF cl_salv_events_table
+        IMPORTING e_salv_function.
+ENDCLASS.
+
+CLASS lcl_event_handler IMPLEMENTATION.
+  METHOD on_added_function.
+    " Handle custom SALV function: close selected items
+    CASE e_salv_function.
+      WHEN gc_func_close.
+        PERFORM close_selected.
+    ENDCASE.
+  ENDMETHOD.
+ENDCLASS.
+
+DATA: go_event_handler TYPE REF TO lcl_event_handler.
+
+*----------------------------------------------------------------------*
+* Start-of-selection
+*----------------------------------------------------------------------*
+START-OF-SELECTION.
+  " Fetch data per selection criteria
+  PERFORM get_data.
+
+  " Exit if nothing to display
+  IF lt_alv IS INITIAL.
+    MESSAGE 'No open purchase order items found for the given selection' TYPE 'S'.
+    EXIT.
+  ENDIF.
+
+  " Display ALV list
+  PERFORM display_alv.
+
+*----------------------------------------------------------------------*
+* Form routines
+*----------------------------------------------------------------------*
+
+FORM get_data.
+  " Build dataset with EKPO open items and related info (EKKO/LFA1/MARA/ZTA)
+  CLEAR lt_alv.
+
+  SELECT
+    p~ebeln,
+    p~ebelp,
+    p~matnr,
+    p~werks,
+    m~mtart,
+    k~lifnr,
+    f~name1,
+    p~elikz,
+    k~bedat    AS bedat_ekko,
+    z~bedat    AS bedat_zta
+    FROM ekpo AS p
+    INNER JOIN ekko AS k ON k~ebeln = p~ebeln
+    LEFT  OUTER JOIN mara AS m ON m~matnr = p~matnr
+    LEFT  OUTER JOIN lfa1 AS f ON f~lifnr = k~lifnr
+    LEFT  OUTER JOIN zta_mm_po AS z
+       ON  z~ebeln = p~ebeln
+       AND z~ebelp = p~ebelp
+       AND z~matnr = p~matnr
+    WHERE p~werks IN @s_werks
+      AND p~elikz = @space
+      AND ( @s_matnr IS INITIAL OR p~matnr IN @s_matnr )
+      AND ( @s_lifnr IS INITIAL OR k~lifnr IN @s_lifnr )
+      AND ( @s_mtart IS INITIAL OR m~mtart IN @s_mtart )
+    INTO TABLE @lt_alv.
+ENDFORM.
+
+FORM display_alv.
+  " Create and configure SALV table, functions, layout, and columns
+  TRY.
+      cl_salv_table=>factory(
+        IMPORTING
+          r_salv_table = go_salv
+        CHANGING
+          t_table      = lt_alv ).
+
+      " Enable all standard functions (sort, filter, subtotal, export, etc.)
+      go_functions = go_salv->get_functions( ).
+      go_functions->set_all( abap_true ).
+
+      " Add custom function button for closing items
+      go_events = go_salv->get_event( ).
+      CREATE OBJECT go_event_handler.
+      SET HANDLER go_event_handler->on_added_function FOR go_events.
+
+      go_functions->add_function(
+        name     = gc_func_close
+        text     = 'Close Selected'
+        icon     = '@0S@'
+        tooltip  = 'Close selected PO items (set EKPO-ELIKZ = X)'
+      ).
+
+      " Selection: allow multi-row selection
+      go_sel = go_salv->get_selections( ).
+      go_sel->set_selection_mode( if_salv_c_selection_mode=>row ).
+
+      " Layout: allow saving variants by user
+      go_layout = go_salv->get_layout( ).
+      DATA(ls_key) = VALUE salv_s_layout_key( report = sy-repid handle = 'MAIN' ).
+      go_layout->set_key( ls_key ).
+      go_layout->set_save_restriction( if_salv_c_layout=>restrict_none ).
+
+      " Optimize columns and set headers
+      go_cols = go_salv->get_columns( ).
+      go_cols->set_optimize( abap_true ).
+      PERFORM set_column_texts.
+
+      " Display ALV grid
+      go_salv->display( ).
+
+    CATCH cx_salv_msg INTO DATA(lx_msg).
+      MESSAGE lx_msg->get_text( ) TYPE 'E'.
+  ENDTRY.
+ENDFORM.
+
+FORM set_column_texts.
+  " Friendly headers for ALV columns
+  DATA: lo_col TYPE REF TO cl_salv_column_table.
+
+  TRY.
+      lo_col = go_cols->get_column( 'EBELN' ).
+      lo_col->set_long_text( 'PO Number' ).
+      lo_col->set_medium_text( 'PO' ).
+      lo_col->set_short_text( 'PO' ).
+
+      lo_col = go_cols->get_column( 'EBELP' ).
+      lo_col->set_long_text( 'PO Item' ).
+      lo_col->set_medium_text( 'Item' ).
+      lo_col->set_short_text( 'Itm' ).
+
+      lo_col = go_cols->get_column( 'MATNR' ).
+      lo_col->set_long_text( 'Material' ).
+      lo_col->set_medium_text( 'Material' ).
+      lo_col->set_short_text( 'Material' ).
+
+      lo_col = go_cols->get_column( 'WERKS' ).
+      lo_col->set_long_text( 'Plant' ).
+      lo_col->set_medium_text( 'Plant' ).
+      lo_col->set_short_text( 'Plant' ).
+
+      lo_col = go_cols->get_column( 'MTART' ).
+      lo_col->set_long_text( 'Material Type' ).
+      lo_col->set_medium_text( 'Mat. Type' ).
+      lo_col->set_short_text( 'MTyp' ).
+
+      lo_col = go_cols->get_column( 'LIFNR' ).
+      lo_col->set_long_text( 'Vendor' ).
+      lo_col->set_medium_text( 'Vendor' ).
+      lo_col->set_short_text( 'Vendor' ).
+
+      lo_col = go_cols->get_column( 'NAME1' ).
+      lo_col->set_long_text( 'Vendor Name' ).
+      lo_col->set_medium_text( 'Name' ).
+      lo_col->set_short_text( 'Name' ).
+
+      lo_col = go_cols->get_column( 'ELIKZ' ).
+      lo_col->set_long_text( 'Delivery Completed (Item Closed)' ).
+      lo_col->set_medium_text( 'Closed' ).
+      lo_col->set_short_text( 'Clsd' ).
+
+      lo_col = go_cols->get_column( 'BEDAT_EKKO' ).
+      lo_col->set_long_text( 'PO Date (EKKO)' ).
+      lo_col->set_medium_text( 'PO Date' ).
+      lo_col->set_short_text( 'PO Dt' ).
+
+      lo_col = go_cols->get_column( 'BEDAT_ZTA' ).
+      lo_col->set_long_text( 'PO Date (ZTA_MM_PO)' ).
+      lo_col->set_medium_text( 'ZTA PO Date' ).
+      lo_col->set_short_text( 'ZTA Dt' ).
+
+    CATCH cx_salv_not_found.
+      " Ignore if any column not found
+  ENDTRY.
+ENDFORM.
+
+FORM refresh_alv.
+  " Refresh SALV display after data change
+  IF go_salv IS BOUND.
+    TRY.
+        go_salv->refresh( ).
+      CATCH cx_salv_msg.
+        " Ignore refresh issues
+    ENDTRY.
+  ENDIF.
+ENDFORM.
+
+FORM close_selected.
+  " Close selected items by setting EKPO-ELIKZ = 'X' with safety check
+  DATA: lt_rows TYPE salv_t_row,
+        lv_row  TYPE salv_de_row,
+        ls_row  TYPE ty_alv.
+
+  CLEAR: gv_closed_ok, gv_closed_err.
+
+  " Get selected rows from SALV
+  IF go_salv IS BOUND.
+    go_sel = go_salv->get_selections( ).
+    go_sel->get_selected_rows( IMPORTING rows = lt_rows ).
+  ENDIF.
+
+  " Require at least one selected row
+  IF lt_rows IS INITIAL.
+    MESSAGE 'Please select at least one row to close' TYPE 'S'.
+    RETURN.
+  ENDIF.
+
+  " Loop through selected rows and update EKPO with ELIKZ = space guard
+  LOOP AT lt_rows INTO lv_row.
+    READ TABLE lt_alv INTO ls_row INDEX lv_row.
+    IF sy-subrc <> 0.
+      CONTINUE.
+    ENDIF.
+
+    " Single-row update with concurrency guard (only if still open)
+    UPDATE ekpo
+      SET elikz = 'X'
+      WHERE ebeln = @ls_row-ebeln
+        AND ebelp = @ls_row-ebelp
+        AND elikz = @space.
+
+    IF sy-subrc = 0.
+      gv_closed_ok = gv_closed_ok + 1.
+    ELSE.
+      gv_closed_err = gv_closed_err + 1.
+    ENDIF.
+  ENDLOOP.
+
+  " Commit only if at least one successful update
+  IF gv_closed_ok > 0.
+    COMMIT WORK AND WAIT.
+  ENDIF.
+
+  " Re-fetch data to show remaining open items and refresh ALV
+  PERFORM get_data.
+  PERFORM refresh_alv.
+
+  " Feedback message
+  MESSAGE |Closed: { gv_closed_ok }  Failed/Skipped: { gv_closed_err }| TYPE 'S'.
+ENDFORM.
+
+**********************************************************************
+* Auto-Generated Data Dictionary Definitions
+**********************************************************************
+
+### ZTA_MM_PO
+| Field Name | Data Element | Data Type | Description |
+|-------------|--------------|------------|--------------|
+| MANDT | MANDT | CLNT3 | Client |
+| EBELN | EBELN | CHAR10 | Purchasing Document Number |
+| EBELP | EBELP | NUMC5 | Purchasing Document Item Number |
+| MATNR | MATNR | CHAR18 | Material Number |
+| BEDAT | BEDAT | DATS8 | Document Date (PO Date) |
+
+- Primary key: MANDT, EBELN, EBELP, MATNR
+- Foreign keys: EBELN→EKKO-EBELN; (EBELN, EBELP)→EKPO-(EBELN, EBELP); MATNR→MARA-MATNR
+- Technical settings: Delivery class A; Data class APPL1; Buffering not allowed
+
+Example SELECT (to be used in joins later):
+- Standalone read
+  - SELECT matnr, ebeln, ebelp, bedat FROM zta_mm_po INTO TABLE @DATA(lt_zta_mm_po) WHERE ebeln IN @lt_ebeln AND matnr IN @s_matnr.
+- As used in program join (excerpt):
+  - LEFT OUTER JOIN zta_mm_po AS z ON z~ebeln = p~ebeln AND z~ebelp = p~ebelp AND z~matnr = p~matnr
+
+
+### ZSTR_MM_PO_ALV
+(ALV output structure used by program ZMM_PO_CLOSE)
+
+| Field Name | Data Element | Data Type | Description |
+|-------------|--------------|------------|--------------|
+| EBELN | EBELN | CHAR10 | PO Number |
+| EBELP | EBELP | NUMC5 | PO Item |
+| MATNR | MATNR | CHAR18 | Material |
+| WERKS | WERKS_D | CHAR4 | Plant |
+| MTART | MTART | CHAR4 | Material Type |
+| LIFNR | LIFNR | CHAR10 | Vendor |
+| NAME1 | NAME1 | CHAR35 | Vendor Name |
+| ELIKZ | ELIKZ | CHAR1 | Delivery Completed (Item Closed) |
+| BEDAT_EKKO | BEDAT | DATS8 | PO Date (from EKKO) |
+| BEDAT_ZTA | BEDAT | DATS8 | PO Date (from ZTA_MM_PO) |
+
+Notes:
+- This structure mirrors the ALV line type in ZMM_PO_CLOSE and references standard SAP data elements for semantic consistency.
+
+
+### ZTT_MM_PO_ALV
+(Table type for ALV data in ZMM_PO_CLOSE)
+
+| Field Name | Data Element | Data Type | Description |
+|-------------|--------------|------------|--------------|
+| LINE TYPE | ZSTR_MM_PO_ALV | - | Standard table of ZSTR_MM_PO_ALV with default key |

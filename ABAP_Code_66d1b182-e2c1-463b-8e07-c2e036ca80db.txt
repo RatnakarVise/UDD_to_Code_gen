@@ -1,0 +1,485 @@
+REPORT zmm_po_close.
+
+*----------------------------------------------------------------------
+* Type Declarations
+*----------------------------------------------------------------------
+TYPES: BEGIN OF ty_out,
+         ebeln  TYPE ekpo-ebeln,     "PO Number
+         ebelp  TYPE ekpo-ebelp,     "PO Item
+         lifnr  TYPE ekko-lifnr,     "Vendor
+         name1  TYPE lfa1-name1,     "Vendor Name
+         matnr  TYPE ekpo-matnr,     "Material
+         mtart  TYPE mara-mtart,     "Material Type
+         werks  TYPE ekpo-werks,     "Plant
+         menge  TYPE ekpo-menge,     "Order Qty
+         meins  TYPE ekpo-meins,     "UoM
+         elikz  TYPE ekpo-elikz,     "Delivery Completed Indicator
+         eindt  TYPE eket-eindt,     "Earliest Schedule Line Date
+       END OF ty_out.
+
+TYPES: BEGIN OF ty_ekpo_key,
+         ebeln TYPE ekpo-ebeln,
+         ebelp TYPE ekpo-ebelp,
+       END OF ty_ekpo_key.
+
+*----------------------------------------------------------------------
+* Data Declarations
+*----------------------------------------------------------------------
+DATA: gt_out     TYPE STANDARD TABLE OF ty_out WITH DEFAULT KEY,
+      gs_out     TYPE ty_out,
+      gt_to_close TYPE STANDARD TABLE OF ty_ekpo_key WITH DEFAULT KEY.
+
+DATA: go_alv     TYPE REF TO cl_salv_table.
+
+DATA: gv_repid   TYPE sy-repid VALUE sy-repid.
+
+*----------------------------------------------------------------------
+* Selection Screen
+*----------------------------------------------------------------------
+SELECT-OPTIONS:
+  s_matnr FOR mara-matnr,
+  s_werks FOR ekpo-werks OBLIGATORY,
+  s_lifnr FOR ekko-lifnr.
+
+PARAMETERS:
+  p_mtart TYPE mara-mtart.
+
+*----------------------------------------------------------------------
+* Local Classes for ALV Events
+*----------------------------------------------------------------------
+CLASS lcl_event_handler DEFINITION FINAL.
+  PUBLIC SECTION.
+    METHODS:
+      on_user_command
+        FOR EVENT added_function OF cl_salv_events_table
+        IMPORTING e_salv_function.
+    METHODS:
+      constructor
+        IMPORTING ir_alv TYPE REF TO cl_salv_table.
+  PRIVATE SECTION.
+    DATA: mr_alv TYPE REF TO cl_salv_table.
+    METHODS:
+      close_selected_items.
+ENDCLASS.
+
+CLASS lcl_event_handler IMPLEMENTATION.
+
+  METHOD constructor.
+    mr_alv = ir_alv.
+  ENDMETHOD.
+
+  METHOD on_user_command.
+    CASE e_salv_function.
+      WHEN 'ZCLOSE'.
+        close_selected_items( ).
+    ENDCASE.
+  ENDMETHOD.
+
+  METHOD close_selected_items.
+    DATA: lo_sel     TYPE REF TO cl_salv_selections,
+          lt_rows    TYPE salv_t_row,
+          lv_rows    TYPE i,
+          ls_row     TYPE salv_s_row,
+          ls_key     TYPE ty_ekpo_key,
+          lt_keys    TYPE STANDARD TABLE OF ty_ekpo_key WITH EMPTY KEY,
+          lt_updated TYPE STANDARD TABLE OF ty_ekpo_key WITH EMPTY KEY,
+          lt_failed  TYPE STANDARD TABLE OF ty_ekpo_key WITH EMPTY KEY,
+          lt_ebeln   TYPE SORTED TABLE OF ekpo-ebeln WITH UNIQUE KEY table_line,
+          lv_subrc   TYPE sy-subrc.
+
+    IF mr_alv IS INITIAL.
+      MESSAGE 'ALV not initialized' TYPE 'E'.
+      RETURN.
+    ENDIF.
+
+    lo_sel = mr_alv->get_selections( ).
+    lt_rows = lo_sel->get_selected_rows( ).
+    DESCRIBE TABLE lt_rows LINES lv_rows.
+
+    IF lv_rows = 0.
+      MESSAGE 'No rows selected' TYPE 'S'.
+      RETURN.
+    ENDIF.
+
+    CLEAR: gt_to_close, lt_keys, lt_ebeln.
+    LOOP AT lt_rows INTO ls_row.
+      READ TABLE gt_out INTO gs_out INDEX ls_row-row.
+      IF sy-subrc = 0.
+        "Only consider rows still open
+        IF gs_out-elikz IS INITIAL.
+          ls_key-ebeln = gs_out-ebeln.
+          ls_key-ebelp = gs_out-ebelp.
+          APPEND ls_key TO lt_keys.
+          INSERT gs_out-ebeln INTO TABLE lt_ebeln.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+    IF lt_keys IS INITIAL.
+      MESSAGE 'Nothing to close in selected rows' TYPE 'S'.
+      RETURN.
+    ENDIF.
+
+    "Lock each PO header before update
+    DATA: lv_ebeln TYPE ekko-ebeln.
+
+    LOOP AT lt_ebeln INTO lv_ebeln.
+      CALL FUNCTION 'ENQUEUE_E_EKKO'
+        EXPORTING
+          ebeln          = lv_ebeln
+        EXCEPTIONS
+          foreign_lock   = 1
+          system_failure = 2
+          OTHERS         = 3.
+      IF sy-subrc <> 0.
+        "Collect all items for that PO to failed and remove from keys
+        LOOP AT lt_keys INTO ls_key WHERE ebeln = lv_ebeln.
+          APPEND ls_key TO lt_failed.
+          DELETE lt_keys INDEX sy-tabix.
+        ENDLOOP.
+      ENDIF.
+    ENDLOOP.
+
+    IF lt_keys IS INITIAL.
+      MESSAGE 'Could not lock any selected PO(s).' TYPE 'E'.
+      RETURN.
+    ENDIF.
+
+    "Perform updates
+    LOOP AT lt_keys INTO ls_key.
+      UPDATE ekpo
+        SET elikz = 'X'
+        WHERE ebeln = ls_key-ebeln
+          AND ebelp = ls_key-ebelp
+          AND elikz = space.
+      lv_subrc = sy-subrc.
+      IF lv_subrc = 0 AND sy-dbcnt > 0.
+        APPEND ls_key TO lt_updated.
+      ELSE.
+        APPEND ls_key TO lt_failed.
+      ENDIF.
+    ENDLOOP.
+
+    COMMIT WORK.
+
+    "Unlock headers
+    LOOP AT lt_ebeln INTO lv_ebeln.
+      CALL FUNCTION 'DEQUEUE_E_EKKO'
+        EXPORTING
+          ebeln = lv_ebeln.
+    ENDLOOP.
+
+    "Reflect changes in ALV data
+    LOOP AT lt_updated INTO ls_key.
+      READ TABLE gt_out INTO gs_out WITH KEY ebeln = ls_key-ebeln ebelp = ls_key-ebelp.
+      IF sy-subrc = 0.
+        gs_out-elikz = 'X'.
+        MODIFY gt_out FROM gs_out TRANSPORTING elikz WHERE ebeln = ls_key-ebeln AND ebelp = ls_key-ebelp.
+      ENDIF.
+    ENDLOOP.
+
+    "Refresh display
+    mr_alv->display( ).
+
+    DATA(lv_ok) = lines( lt_updated ).
+    DATA(lv_ko) = lines( lt_failed ).
+    MESSAGE |Closed: { lv_ok } item(s); Failed: { lv_ko } item(s)| TYPE 'S'.
+
+  ENDMETHOD.
+ENDCLASS.
+
+*----------------------------------------------------------------------
+* Start-of-selection
+*----------------------------------------------------------------------
+START-OF-SELECTION.
+  PERFORM get_data.
+
+END-OF-SELECTION.
+  IF gt_out IS INITIAL.
+    MESSAGE 'No data found for selection' TYPE 'S'.
+  ELSE.
+    PERFORM display_alv.
+  ENDIF.
+
+*----------------------------------------------------------------------
+* Subroutines
+*----------------------------------------------------------------------
+FORM get_data.
+  DATA: lt_mara_mats   TYPE SORTED TABLE OF mara-matnr WITH UNIQUE KEY table_line,
+        lt_ekko_po     TYPE SORTED TABLE OF ekko-ebeln WITH UNIQUE KEY table_line,
+        lt_items       TYPE STANDARD TABLE OF ty_out WITH EMPTY KEY,
+        lt_lfa1        TYPE STANDARD TABLE OF lfa1 WITH EMPTY KEY,
+        lt_mara        TYPE STANDARD TABLE OF mara WITH EMPTY KEY,
+        lt_eket        TYPE STANDARD TABLE OF eket WITH EMPTY KEY,
+        lt_keys        TYPE STANDARD TABLE OF ty_ekpo_key WITH EMPTY KEY.
+
+  DATA: lr_matnr TYPE RANGE OF matnr,
+        lr_ebeln TYPE RANGE OF ebeln.
+
+  FIELD-SYMBOLS: <ls_out> TYPE ty_out.
+
+  "1) If material type provided, get materials by MTART
+  IF p_mtart IS NOT INITIAL.
+    SELECT matnr
+      FROM mara
+      INTO TABLE @lt_mara_mats
+      WHERE mtart = @p_mtart.
+  ENDIF.
+
+  "Build MATNR filter range from S_MATNR and MTART result (intersection if both present)
+  CLEAR lr_matnr.
+  IF s_matnr[] IS NOT INITIAL AND lt_mara_mats IS INITIAL.
+    lr_matnr = s_matnr[].
+  ELSEIF s_matnr[] IS INITIAL AND lt_mara_mats IS NOT INITIAL.
+    LOOP AT lt_mara_mats ASSIGNING FIELD-SYMBOL(<lv_mat>).
+      APPEND VALUE #( sign = 'I' option = 'EQ' low = <lv_mat> ) TO lr_matnr.
+    ENDLOOP.
+  ELSEIF s_matnr[] IS NOT INITIAL AND lt_mara_mats IS NOT INITIAL.
+    "Intersect: keep only MATNR that are in both
+    LOOP AT lt_mara_mats ASSIGNING FIELD-SYMBOL(<lv_mat_i>).
+      READ TABLE s_matnr WITH KEY low = <lv_mat_i> TRANSPORTING NO FIELDS BINARY SEARCH.
+      IF sy-subrc = 0.
+        APPEND VALUE #( sign = 'I' option = 'EQ' low = <lv_mat_i> ) TO lr_matnr.
+      ENDIF.
+    ENDLOOP.
+    IF lr_matnr IS INITIAL.
+      "No intersection => return empty
+      CLEAR gt_out.
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+  "2) If vendor provided, get POs by LIFNR
+  IF s_lifnr[] IS NOT INITIAL.
+    SELECT ebeln
+      FROM ekko
+      INTO TABLE @lt_ekko_po
+      WHERE lifnr IN @s_lifnr.
+  ENDIF.
+
+  "Build EBELN range if needed
+  CLEAR lr_ebeln.
+  IF lt_ekko_po IS NOT INITIAL.
+    LOOP AT lt_ekko_po ASSIGNING FIELD-SYMBOL(<lv_po>).
+      APPEND VALUE #( sign = 'I' option = 'EQ' low = <lv_po> ) TO lr_ebeln.
+    ENDLOOP.
+  ENDIF.
+
+  "3) Select from EKPO with filters and join EKKO to get LIFNR
+  DATA(lv_space) = ' '.
+  CLEAR gt_out.
+
+  IF lr_ebeln IS INITIAL AND lr_matnr IS INITIAL.
+    "Filter only by Plant (mandatory) and open items
+    SELECT a~ebeln, a~ebelp, b~lifnr,
+           a~matnr, a~werks, a~menge, a~meins, a~elikz
+      FROM ekpo AS a
+      INNER JOIN ekko AS b
+        ON a~ebeln = b~ebeln
+      INTO CORRESPONDING FIELDS OF TABLE @gt_out
+      WHERE a~elikz = @lv_space
+        AND a~werks IN @s_werks.
+  ELSEIF lr_ebeln IS INITIAL AND lr_matnr IS NOT INITIAL.
+    SELECT a~ebeln, a~ebelp, b~lifnr,
+           a~matnr, a~werks, a~menge, a~meins, a~elikz
+      FROM ekpo AS a
+      INNER JOIN ekko AS b
+        ON a~ebeln = b~ebeln
+      INTO CORRESPONDING FIELDS OF TABLE @gt_out
+      WHERE a~elikz = @lv_space
+        AND a~werks IN @s_werks
+        AND a~matnr IN @lr_matnr.
+  ELSEIF lr_ebeln IS NOT INITIAL AND lr_matnr IS INITIAL.
+    SELECT a~ebeln, a~ebelp, b~lifnr,
+           a~matnr, a~werks, a~menge, a~meins, a~elikz
+      FROM ekpo AS a
+      INNER JOIN ekko AS b
+        ON a~ebeln = b~ebeln
+      INTO CORRESPONDING FIELDS OF TABLE @gt_out
+      WHERE a~elikz = @lv_space
+        AND a~werks IN @s_werks
+        AND a~ebeln IN @lr_ebeln.
+  ELSE.
+    SELECT a~ebeln, a~ebelp, b~lifnr,
+           a~matnr, a~werks, a~menge, a~meins, a~elikz
+      FROM ekpo AS a
+      INNER JOIN ekko AS b
+        ON a~ebeln = b~ebeln
+      INTO CORRESPONDING FIELDS OF TABLE @gt_out
+      WHERE a~elikz = @lv_space
+        AND a~werks IN @s_werks
+        AND a~ebeln IN @lr_ebeln
+        AND a~matnr IN @lr_matnr.
+  ENDIF.
+
+  IF gt_out IS INITIAL.
+    RETURN.
+  ENDIF.
+
+  "4) Enrich with Vendor Name (LFA1)
+  DATA: lt_lifnr TYPE SORTED TABLE OF lfa1-lifnr WITH UNIQUE KEY table_line.
+  LOOP AT gt_out ASSIGNING <ls_out>.
+    INSERT <ls_out>-lifnr INTO TABLE lt_lifnr.
+  ENDLOOP.
+  IF lt_lifnr IS NOT INITIAL.
+    SELECT lifnr name1
+      FROM lfa1
+      INTO TABLE @lt_lfa1
+      FOR ALL ENTRIES IN @lt_lifnr
+      WHERE lifnr = @lt_lifnr-table_line.
+    SORT lt_lfa1 BY lifnr.
+  ENDIF.
+
+  "5) Enrich with Material Type (MARA)
+  DATA: lt_matnr TYPE SORTED TABLE OF mara-matnr WITH UNIQUE KEY table_line.
+  LOOP AT gt_out ASSIGNING <ls_out>.
+    IF <ls_out>-matnr IS NOT INITIAL.
+      INSERT <ls_out>-matnr INTO TABLE lt_matnr.
+    ENDIF.
+  ENDLOOP.
+  IF lt_matnr IS NOT INITIAL.
+    SELECT matnr mtart
+      FROM mara
+      INTO TABLE @lt_mara
+      FOR ALL ENTRIES IN @lt_matnr
+      WHERE matnr = @lt_matnr-table_line.
+    SORT lt_mara BY matnr.
+  ENDIF.
+
+  "6) Get earliest schedule line date per item (EKET)
+  DATA: lt_keys_eket TYPE STANDARD TABLE OF ty_ekpo_key WITH EMPTY KEY.
+  LOOP AT gt_out ASSIGNING <ls_out>.
+    APPEND VALUE ty_ekpo_key( ebeln = <ls_out>-ebeln ebelp = <ls_out>-ebelp ) TO lt_keys_eket.
+  ENDLOOP.
+  IF lt_keys_eket IS NOT INITIAL.
+    SELECT ebeln ebelp eindt
+      FROM eket
+      INTO TABLE @lt_eket
+      FOR ALL ENTRIES IN @lt_keys_eket
+      WHERE ebeln = @lt_keys_eket-ebeln
+        AND ebelp = @lt_keys_eket-ebelp.
+    SORT lt_eket BY ebeln ebelp eindt.
+  ENDIF.
+
+  "7) Map enrichments into output
+  LOOP AT gt_out ASSIGNING <ls_out>.
+    "Vendor Name
+    READ TABLE lt_lfa1 INTO DATA(ls_lfa1) WITH KEY lifnr = <ls_out>-lifnr BINARY SEARCH.
+    IF sy-subrc = 0.
+      <ls_out>-name1 = ls_lfa1-name1.
+    ENDIF.
+
+    "Material Type
+    READ TABLE lt_mara INTO DATA(ls_mara) WITH KEY matnr = <ls_out>-matnr BINARY SEARCH.
+    IF sy-subrc = 0.
+      <ls_out>-mtart = ls_mara-mtart.
+    ENDIF.
+
+    "Earliest Schedule Date
+    READ TABLE lt_eket INTO DATA(ls_eket) WITH KEY ebeln = <ls_out>-ebeln ebelp = <ls_out>-ebelp BINARY SEARCH.
+    IF sy-subrc = 0.
+      <ls_out>-eindt = ls_eket-eindt.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.
+
+FORM display_alv.
+  TRY.
+      cl_salv_table=>factory(
+        IMPORTING
+          r_salv_table = go_alv
+        CHANGING
+          t_table      = gt_out ).
+
+      "Columns configuration
+      DATA(lo_cols) = go_alv->get_columns( ).
+      lo_cols->set_optimize( abap_true ).
+
+      DATA(lo_col) = lo_cols->get_column( 'EBELN' ).
+      lo_col->set_long_text( 'PO Number' ).
+      lo_col->set_medium_text( 'PO' ).
+      lo_col->set_short_text( 'PO' ).
+
+      lo_col = lo_cols->get_column( 'EBELP' ).
+      lo_col->set_long_text( 'PO Item' ).
+      lo_col->set_medium_text( 'Item' ).
+      lo_col->set_short_text( 'Itm' ).
+
+      lo_col = lo_cols->get_column( 'LIFNR' ).
+      lo_col->set_long_text( 'Vendor' ).
+      lo_col->set_medium_text( 'Vendor' ).
+      lo_col->set_short_text( 'Vendor' ).
+
+      lo_col = lo_cols->get_column( 'NAME1' ).
+      lo_col->set_long_text( 'Vendor Name' ).
+      lo_col->set_medium_text( 'Name' ).
+      lo_col->set_short_text( 'Name' ).
+
+      lo_col = lo_cols->get_column( 'MATNR' ).
+      lo_col->set_long_text( 'Material' ).
+      lo_col->set_medium_text( 'Material' ).
+      lo_col->set_short_text( 'Mat.' ).
+
+      lo_col = lo_cols->get_column( 'MTART' ).
+      lo_col->set_long_text( 'Material Type' ).
+      lo_col->set_medium_text( 'Mat. Type' ).
+      lo_col->set_short_text( 'MType' ).
+
+      lo_col = lo_cols->get_column( 'WERKS' ).
+      lo_col->set_long_text( 'Plant' ).
+      lo_col->set_medium_text( 'Plant' ).
+      lo_col->set_short_text( 'Plant' ).
+
+      lo_col = lo_cols->get_column( 'MENGE' ).
+      lo_col->set_long_text( 'Order Quantity' ).
+      lo_col->set_medium_text( 'Quantity' ).
+      lo_col->set_short_text( 'Qty' ).
+
+      lo_col = lo_cols->get_column( 'MEINS' ).
+      lo_col->set_long_text( 'Unit of Measure' ).
+      lo_col->set_medium_text( 'UoM' ).
+      lo_col->set_short_text( 'UoM' ).
+
+      lo_col = lo_cols->get_column( 'ELIKZ' ).
+      lo_col->set_long_text( 'Delivery Completed' ).
+      lo_col->set_medium_text( 'Del.Comp.' ).
+      lo_col->set_short_text( 'DC' ).
+
+      lo_col = lo_cols->get_column( 'EINDT' ).
+      lo_col->set_long_text( 'Earliest Schedule Date' ).
+      lo_col->set_medium_text( 'Sched.Date' ).
+      lo_col->set_short_text( 'Date' ).
+
+      "Selection mode: multiple rows
+      DATA(lo_sel) = go_alv->get_selections( ).
+      lo_sel->set_selection_mode( if_salv_c_selection_mode=>multiple ).
+
+      "Functions: enable all + custom close button
+      DATA(lo_fun) = go_alv->get_functions( ).
+      lo_fun->set_all( abap_true ).
+      lo_fun->add_function(
+        name     = 'ZCLOSE'
+        icon     = icon_complete
+        text     = 'Close Items'
+        tooltip  = 'Set Delivery Completed (EKPO-ELIKZ) for selected items'
+        position = if_salv_c_function_position=>right_of_salv_functions ).
+
+      "Layout: allow saving
+      DATA(lo_layout) = go_alv->get_layout( ).
+      DATA(ls_key)    = VALUE salv_s_layout_key( report = gv_repid ).
+      lo_layout->set_key( ls_key ).
+      lo_layout->set_default( abap_true ).
+      lo_layout->set_save_restriction( if_salv_c_layout=>restrict_none ).
+
+      "Events: handle custom function
+      DATA(lo_events) = go_alv->get_event( ).
+      DATA(lo_hdlr)   = NEW lcl_event_handler( go_alv ).
+      SET HANDLER lo_hdlr->on_user_command FOR lo_events.
+
+      go_alv->display( ).
+
+    CATCH cx_salv_msg INTO DATA(lx_msg).
+      MESSAGE lx_msg->get_text( ) TYPE 'E'.
+  ENDTRY.
+ENDFORM.

@@ -1,0 +1,474 @@
+REPORT zmm_po_close.
+
+*---------------------------------------------------------------------*
+* Utility to close open POs: Set EKPO-ELIKZ = 'X' for selected items  *
+* ALV with sorting, filtering, totals/subtotals, export, layout save  *
+*---------------------------------------------------------------------*
+
+TABLES: ekko, ekpo, eket, mara, lfa1.
+
+CONSTANTS gc_func_close TYPE salv_de_function VALUE 'CLOSE'.
+
+* Forward declaration for local event handler class
+CLASS lcl_events DEFINITION DEFERRED.
+
+*--------------------------- Selection screen ------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-t01.
+SELECT-OPTIONS:
+  s_matnr FOR mara-matnr,               "Material Number Range
+  s_werks FOR ekpo-werks OBLIGATORY,    "Plant Range (Mandatory)
+  s_lifnr FOR ekko-lifnr,               "Vendor Range
+  s_mtart FOR mara-mtart.               "Material Type Range
+SELECTION-SCREEN END OF BLOCK b1.
+
+INITIALIZATION.
+  text-t01 = 'Selection Criteria'.
+  lv_repid = sy-repid.
+
+*---------------------------- Types ----------------------------------*
+TYPES: BEGIN OF ty_alv,
+         ebeln       TYPE ebeln,
+         ebelp       TYPE ebelp,
+         bsart       TYPE bsart,
+         aedat       TYPE eerdat,          "Document Date (Created On)
+         lifnr       TYPE lifnr,
+         name1       TYPE name1_gp,
+         matnr       TYPE matnr,
+         txz01       TYPE txz01,
+         mtart       TYPE mtart,
+         werks       TYPE ewerk,
+         menge       TYPE menge_d,
+         wemng       TYPE wemng,           "GR Quantity
+         open_qty    TYPE menge_d,
+         meins       TYPE meins,
+         elikz       TYPE elikz,           "Delivery Completed Indicator
+         next_eindt  TYPE eindt,           "Next Schedule Line Date
+       END OF ty_alv.
+
+TYPES ty_t_alv TYPE STANDARD TABLE OF ty_alv WITH DEFAULT KEY.
+
+*---------------------------- Data -----------------------------------*
+DATA:
+  lt_alv     TYPE ty_t_alv,
+  ls_alv     TYPE ty_alv,
+  go_alv     TYPE REF TO cl_salv_table,
+  go_events  TYPE REF TO cl_salv_events_table,
+  go_hndlr   TYPE REF TO lcl_events,
+  lv_repid   TYPE sy-repid.
+
+*------------------------- Local Event Handler -----------------------*
+CLASS lcl_events DEFINITION FINAL.
+  PUBLIC SECTION.
+    METHODS on_user_command
+      FOR EVENT added_function OF cl_salv_events_table
+      IMPORTING e_salv_function.
+ENDCLASS.
+
+CLASS lcl_events IMPLEMENTATION.
+  METHOD on_user_command.
+    CASE e_salv_function.
+      WHEN gc_func_close.
+        PERFORM close_selected_items.
+    ENDCASE.
+  ENDMETHOD.
+ENDCLASS.
+
+*--------------------------- Selection checks ------------------------*
+AT SELECTION-SCREEN.
+  " s_werks is obligatory by definition
+
+*------------------------------ Start --------------------------------*
+START-OF-SELECTION.
+  PERFORM get_data.
+  IF lt_alv IS INITIAL.
+    MESSAGE 'No open PO items found for given criteria.' TYPE 'S'.
+    RETURN.
+  ENDIF.
+  PERFORM display_alv.
+
+*----------------------------- Subroutines ---------------------------*
+
+FORM get_data.
+  " Base extraction: Open items per selected plant(s)
+  DATA lt_base TYPE ty_t_alv.
+
+  CLEAR lt_alv.
+
+  SELECT p~ebeln
+         p~ebelp
+         k~bsart
+         k~aedat
+         k~lifnr
+         v~name1
+         p~matnr
+         p~txz01
+         m~mtart
+         p~werks
+         p~menge
+         p~wemng
+         p~meins
+         p~elikz
+    FROM ekpo AS p
+    INNER JOIN ekko AS k ON k~ebeln = p~ebeln
+    LEFT OUTER JOIN mara AS m ON m~matnr = p~matnr
+    LEFT OUTER JOIN lfa1 AS v ON v~lifnr = k~lifnr
+    INTO TABLE @lt_base
+    WHERE p~elikz = @space
+      AND p~werks IN @s_werks.
+
+  IF lt_base IS INITIAL.
+    CLEAR lt_alv.
+    RETURN.
+  ENDIF.
+
+  " Apply optional filters from selection screen
+  IF s_matnr[] IS NOT INITIAL.
+    DELETE lt_base WHERE matnr NOT IN s_matnr.
+  ENDIF.
+
+  IF s_lifnr[] IS NOT INITIAL.
+    DELETE lt_base WHERE lifnr NOT IN s_lifnr.
+  ENDIF.
+
+  IF s_mtart[] IS NOT INITIAL.
+    DELETE lt_base WHERE mtart NOT IN s_mtart.
+  ENDIF.
+
+  IF lt_base IS INITIAL.
+    CLEAR lt_alv.
+    RETURN.
+  ENDIF.
+
+  " Compute next schedule line date per item (MIN EINDT)
+  TYPES: BEGIN OF ty_min,
+           ebeln TYPE ebeln,
+           ebelp TYPE ebelp,
+           eindt TYPE eindt,
+         END OF ty_min.
+  DATA lt_min TYPE SORTED TABLE OF ty_min WITH UNIQUE KEY ebeln ebelp.
+
+  SELECT ebeln, ebelp, MIN( eindt ) AS eindt
+    FROM eket
+    FOR ALL ENTRIES IN @lt_base
+    WHERE ebeln = @lt_base-ebeln
+      AND ebelp = @lt_base-ebelp
+    GROUP BY ebeln, ebelp
+    INTO TABLE @lt_min.
+
+  " Build final ALV dataset with computed open quantity and next_eindt
+  LOOP AT lt_base INTO ls_alv.
+    ls_alv-open_qty = ls_alv-menge - ls_alv-wemng.
+    READ TABLE lt_min INTO DATA(ls_min)
+         WITH TABLE KEY ebeln = ls_alv-ebeln ebelp = ls_alv-ebelp.
+    IF sy-subrc = 0.
+      ls_alv-next_eindt = ls_min-eindt.
+    ENDIF.
+    APPEND ls_alv TO lt_alv.
+  ENDLOOP.
+
+  " Default sort
+  SORT lt_alv BY ebeln ebelp.
+ENDFORM.
+
+FORM display_alv.
+  TRY.
+      cl_salv_table=>factory(
+        IMPORTING
+          r_salv_table = go_alv
+        CHANGING
+          t_table      = lt_alv ).
+
+      " Enable all standard functions (sort, filter, export, etc.)
+      DATA(lo_funcs) = go_alv->get_functions( ).
+      lo_funcs->set_all( abap_true ).
+
+      " Add custom function for closing items
+      lo_funcs->add_function(
+        name     = gc_func_close
+        icon     = '@0V@'             " Green check
+        text     = 'Close Items'
+        tooltip  = 'Set Delivery Completed (ELIKZ = X) for selected items' ).
+
+      " Selection mode - multiple
+      DATA(lo_sel) = go_alv->get_selections( ).
+      lo_sel->set_selection_mode( if_salv_c_selection_mode=>multiple ).
+
+      " Layout - user variant save
+      DATA(lo_layout) = go_alv->get_layout( ).
+      DATA(ls_key)    TYPE salv_s_layout_key.
+      ls_key-report = lv_repid.
+      lo_layout->set_key( ls_key ).
+      lo_layout->set_default( abap_true ).
+      lo_layout->set_save_restriction( if_salv_c_layout=>restrict_none ).
+
+      " Aggregations (totals) for quantities
+      DATA(lo_aggr) = go_alv->get_aggregations( ).
+      lo_aggr->add_aggregation( 'MENGE' ).
+      lo_aggr->add_aggregation( 'WEMNG' ).
+      lo_aggr->add_aggregation( 'OPEN_QTY' ).
+
+      " Column settings
+      DATA(lo_cols) = go_alv->get_columns( ).
+      lo_cols->set_optimize( abap_true ).
+
+      " Set quantity-unit relationships
+      DATA lo_col_menge TYPE REF TO cl_salv_column_table.
+      DATA lo_col_wemng TYPE REF TO cl_salv_column_table.
+      DATA lo_col_open  TYPE REF TO cl_salv_column_table.
+
+      TRY.
+          lo_col_menge ?= lo_cols->get_column( 'MENGE' ).
+          lo_col_menge->set_quantity_column( 'MEINS' ).
+        CATCH cx_salv_not_found.
+      ENDTRY.
+      TRY.
+          lo_col_wemng ?= lo_cols->get_column( 'WEMNG' ).
+          lo_col_wemng->set_quantity_column( 'MEINS' ).
+        CATCH cx_salv_not_found.
+      ENDTRY.
+      TRY.
+          lo_col_open ?= lo_cols->get_column( 'OPEN_QTY' ).
+          lo_col_open->set_quantity_column( 'MEINS' ).
+        CATCH cx_salv_not_found.
+      ENDTRY.
+
+      " Human-friendly column headers
+      PERFORM set_column_headers USING lo_cols.
+
+      " Register event handler
+      go_events = go_alv->get_event( ).
+      CREATE OBJECT go_hndlr.
+      SET HANDLER go_hndlr->on_user_command FOR go_events.
+
+      go_alv->display( ).
+
+    CATCH cx_salv_msg INTO DATA(lx_msg).
+      MESSAGE lx_msg->get_text( ) TYPE 'E'.
+  ENDTRY.
+ENDFORM.
+
+FORM set_column_headers USING io_cols TYPE REF TO cl_salv_columns_table.
+  DATA lo_col TYPE REF TO cl_salv_column_table.
+
+  TRY.
+      lo_col ?= io_cols->get_column( 'EBELN' ).
+      lo_col->set_short_text( 'PO' ).
+      lo_col->set_medium_text( 'PO Number' ).
+      lo_col->set_long_text( 'Purchasing Document Number' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      lo_col ?= io_cols->get_column( 'EBELP' ).
+      lo_col->set_short_text( 'Item' ).
+      lo_col->set_medium_text( 'PO Item' ).
+      lo_col->set_long_text( 'PO Item' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      lo_col ?= io_cols->get_column( 'BSART' ).
+      lo_col->set_short_text( 'DocTy' ).
+      lo_col->set_medium_text( 'Document Type' ).
+      lo_col->set_long_text( 'Purchasing Document Type' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      lo_col ?= io_cols->get_column( 'AEDAT' ).
+      lo_col->set_short_text( 'Created' ).
+      lo_col->set_medium_text( 'Created On' ).
+      lo_col->set_long_text( 'Document Creation Date' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      lo_col ?= io_cols->get_column( 'LIFNR' ).
+      lo_col->set_short_text( 'Vendor' ).
+      lo_col->set_medium_text( 'Vendor' ).
+      lo_col->set_long_text( 'Vendor Number' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      lo_col ?= io_cols->get_column( 'NAME1' ).
+      lo_col->set_short_text( 'Name' ).
+      lo_col->set_medium_text( 'Vendor Name' ).
+      lo_col->set_long_text( 'Vendor Name' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      lo_col ?= io_cols->get_column( 'MATNR' ).
+      lo_col->set_short_text( 'Material' ).
+      lo_col->set_medium_text( 'Material' ).
+      lo_col->set_long_text( 'Material Number' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      lo_col ?= io_cols->get_column( 'TXZ01' ).
+      lo_col->set_short_text( 'Short Text' ).
+      lo_col->set_medium_text( 'Item Short Text' ).
+      lo_col->set_long_text( 'PO Item Short Text' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      lo_col ?= io_cols->get_column( 'MTART' ).
+      lo_col->set_short_text( 'MatType' ).
+      lo_col->set_medium_text( 'Material Type' ).
+      lo_col->set_long_text( 'Material Type' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      lo_col ?= io_cols->get_column( 'WERKS' ).
+      lo_col->set_short_text( 'Plant' ).
+      lo_col->set_medium_text( 'Plant' ).
+      lo_col->set_long_text( 'Plant' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      lo_col ?= io_cols->get_column( 'MENGE' ).
+      lo_col->set_short_text( 'Order Qty' ).
+      lo_col->set_medium_text( 'Order Quantity' ).
+      lo_col->set_long_text( 'Ordered Quantity' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      lo_col ?= io_cols->get_column( 'WEMNG' ).
+      lo_col->set_short_text( 'GR Qty' ).
+      lo_col->set_medium_text( 'GR Quantity' ).
+      lo_col->set_long_text( 'Goods Receipt Quantity' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      lo_col ?= io_cols->get_column( 'OPEN_QTY' ).
+      lo_col->set_short_text( 'Open Qty' ).
+      lo_col->set_medium_text( 'Open Quantity' ).
+      lo_col->set_long_text( 'Open Quantity (MENGE - WEMNG)' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      lo_col ?= io_cols->get_column( 'MEINS' ).
+      lo_col->set_short_text( 'UoM' ).
+      lo_col->set_medium_text( 'Base UoM' ).
+      lo_col->set_long_text( 'Base Unit of Measure' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      lo_col ?= io_cols->get_column( 'ELIKZ' ).
+      lo_col->set_short_text( 'Closed' ).
+      lo_col->set_medium_text( 'Delivery Completed' ).
+      lo_col->set_long_text( 'Delivery Completed Indicator' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      lo_col ?= io_cols->get_column( 'NEXT_EINDT' ).
+      lo_col->set_short_text( 'Next Dlv' ).
+      lo_col->set_medium_text( 'Next Delivery' ).
+      lo_col->set_long_text( 'Next Schedule Line Delivery Date' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+ENDFORM.
+
+FORM close_selected_items.
+  DATA: lt_rows TYPE salv_t_row,
+        lv_msg  TYPE string.
+
+  " Get selected rows from ALV
+  DATA(lo_sel) = go_alv->get_selections( ).
+  lt_rows = lo_sel->get_selected_rows( ).
+
+  IF lt_rows IS INITIAL.
+    MESSAGE 'Please select one or more PO items to close.' TYPE 'S' DISPLAY LIKE 'E'.
+    RETURN.
+  ENDIF.
+
+  " Map selected index to PO item keys (only currently open)
+  TYPES: BEGIN OF ty_key,
+           ebeln TYPE ebeln,
+           ebelp TYPE ebelp,
+           bsart TYPE bsart,
+         END OF ty_key.
+  DATA lt_to_close TYPE SORTED TABLE OF ty_key WITH UNIQUE KEY ebeln ebelp.
+
+  LOOP AT lt_rows ASSIGNING FIELD-SYMBOL(<ls_row>).
+    READ TABLE lt_alv INTO ls_alv INDEX <ls_row>.
+    IF sy-subrc = 0 AND ls_alv-elikz IS INITIAL.
+      INSERT VALUE #( ebeln = ls_alv-ebeln ebelp = ls_alv-ebelp bsart = ls_alv-bsart ) INTO TABLE lt_to_close.
+    ENDIF.
+  ENDLOOP.
+
+  IF lt_to_close IS INITIAL.
+    MESSAGE 'No eligible open items in selection.' TYPE 'S' DISPLAY LIKE 'E'.
+    RETURN.
+  ENDIF.
+
+  " Group by PO to lock header and update items
+  DATA lt_ebeln TYPE SORTED TABLE OF ebeln WITH UNIQUE KEY table_line.
+  LOOP AT lt_to_close ASSIGNING FIELD-SYMBOL(<ls_key>).
+    INSERT <ls_key>-ebeln INTO TABLE lt_ebeln.
+  ENDLOOP.
+
+  DATA: lv_ok   TYPE i VALUE 0,
+        lv_skip TYPE i VALUE 0,
+        lv_err  TYPE i VALUE 0.
+
+  LOOP AT lt_ebeln ASSIGNING FIELD-SYMBOL(<lv_ebeln>).
+    " Lock PO header
+    CALL FUNCTION 'ENQUEUE_EEKKO'
+      EXPORTING
+        ebeln = <lv_ebeln>
+      EXCEPTIONS
+        foreign_lock   = 1
+        system_failure = 2
+        OTHERS         = 3.
+    IF sy-subrc <> 0.
+      lv_skip = lv_skip + 1.
+      CONTINUE.
+    ENDIF.
+
+    " Update all selected items for this PO
+    LOOP AT lt_to_close ASSIGNING <ls_key> WHERE ebeln = <lv_ebeln>.
+      UPDATE ekpo
+         SET elikz = 'X'
+       WHERE ebeln = <ls_key>-ebeln
+         AND ebelp = <ls_key>-ebelp
+         AND elikz = space.
+      IF sy-subrc = 0 AND sy-dbcnt > 0.
+        lv_ok = lv_ok + 1.
+      ELSE.
+        lv_err = lv_err + 1.
+      ENDIF.
+    ENDLOOP.
+
+    " Unlock header
+    CALL FUNCTION 'DEQUEUE_EEKKO'
+      EXPORTING
+        ebeln = <lv_ebeln>.
+  ENDLOOP.
+
+  COMMIT WORK.
+
+  lv_msg = |Items closed: { lv_ok }. Skipped (locked): { lv_skip }. Failed/unchanged: { lv_err }.|.
+  MESSAGE lv_msg TYPE 'S'.
+
+  " Refresh data to reflect updates
+  PERFORM get_data.
+  IF go_alv IS BOUND.
+    TRY.
+        go_alv->refresh( ).
+      CATCH cx_salv_msg.
+        " Fallback: Redisplay
+        PERFORM display_alv.
+    ENDTRY.
+  ENDIF.
+ENDFORM.

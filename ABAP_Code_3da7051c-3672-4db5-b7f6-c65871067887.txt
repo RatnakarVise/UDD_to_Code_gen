@@ -1,0 +1,416 @@
+SECTION 1 - ABAP REPORT PROGRAM
+REPORT zmm_mat_vendor_alv NO STANDARD PAGE HEADING.
+
+TYPE-POOLS abap.
+
+*---------------------------------------------------------------------*
+* Types
+*---------------------------------------------------------------------*
+TYPES: BEGIN OF ty_base,
+         matnr       TYPE mara-matnr,
+         werks       TYPE marc-werks,
+         mtart       TYPE mara-mtart,
+         meins       TYPE mara-meins,
+         maktx       TYPE makt-maktx,
+         plant_name  TYPE t001w-name1,
+       END OF ty_base.
+
+TYPES: BEGIN OF ty_stock,
+         matnr TYPE mard-matnr,
+         werks TYPE mard-werks,
+         labst TYPE mard-labst,
+       END OF ty_stock.
+
+TYPES: BEGIN OF ty_eord,
+         matnr TYPE eord-matnr,
+         werks TYPE eord-werks,
+         lifnr TYPE eord-lifnr,
+         fixkz TYPE eord-fixkz,
+         datab TYPE eord-datab,
+         datbi TYPE eord-datbi,
+       END OF ty_eord.
+
+TYPES: BEGIN OF ty_vendor_map,
+         matnr TYPE eord-matnr,
+         werks TYPE eord-werks,
+         lifnr TYPE eord-lifnr,
+       END OF ty_vendor_map.
+
+TYPES: BEGIN OF ty_vendor,
+         lifnr TYPE lfa1-lifnr,
+         name1 TYPE lfa1-name1,
+       END OF ty_vendor.
+
+TYPES: BEGIN OF ty_alv,
+         matnr        TYPE mara-matnr,
+         mtart        TYPE mara-mtart,
+         maktx        TYPE makt-maktx,
+         werks        TYPE marc-werks,
+         plant_name   TYPE t001w-name1,
+         lifnr        TYPE lfa1-lifnr,
+         vendor_name  TYPE lfa1-name1,
+         meins        TYPE mara-meins,
+         total_stock  TYPE mard-labst,
+       END OF ty_alv.
+
+*---------------------------------------------------------------------*
+* Data
+*---------------------------------------------------------------------*
+DATA: gt_alv   TYPE STANDARD TABLE OF ty_alv WITH EMPTY KEY,
+      gs_alv   TYPE ty_alv.
+
+DATA: gt_base  TYPE STANDARD TABLE OF ty_base WITH EMPTY KEY,
+      gt_eord  TYPE STANDARD TABLE OF ty_eord WITH EMPTY KEY.
+
+"Use hashed table for fast lookups by MATNR/WERKS
+DATA: gt_stock TYPE HASHED TABLE OF ty_stock WITH UNIQUE KEY matnr werks.
+
+DATA: gt_vmap  TYPE HASHED TABLE OF ty_vendor_map WITH UNIQUE KEY matnr werks,
+      gt_vend  TYPE SORTED TABLE OF ty_vendor WITH UNIQUE KEY lifnr.
+
+DATA: go_alv        TYPE REF TO cl_salv_table,
+      go_functions  TYPE REF TO cl_salv_functions,
+      go_layout     TYPE REF TO cl_salv_layout,
+      gs_layout_key TYPE salv_s_layout_key,
+      go_aggr       TYPE REF TO cl_salv_aggregations,
+      go_cols       TYPE REF TO cl_salv_columns_table,
+      go_sorts      TYPE REF TO cl_salv_sorts,
+      go_col        TYPE REF TO cl_salv_column_table,
+      go_sort_col   TYPE REF TO cl_salv_sort_column.
+
+*---------------------------------------------------------------------*
+* Selection screen
+*---------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-h01.
+SELECT-OPTIONS: s_matnr FOR mara-matnr,
+                s_werks FOR marc-werks OBLIGATORY,
+                s_lifnr FOR lfa1-lifnr,
+                s_mtart FOR mara-mtart.
+SELECTION-SCREEN END OF BLOCK b1.
+
+INITIALIZATION.
+  text-h01 = 'Selection Criteria'.
+
+AT SELECTION-SCREEN.
+  IF s_werks[] IS INITIAL.
+    MESSAGE e398(00) WITH 'Plant (S_WERKS) is mandatory.'.
+  ENDIF.
+
+*---------------------------------------------------------------------*
+* Start-of-selection
+*---------------------------------------------------------------------*
+START-OF-SELECTION.
+  PERFORM get_data.
+  IF gt_alv IS INITIAL.
+    MESSAGE i398(00) WITH 'No data found for the given selection.'.
+  ELSE.
+    PERFORM display_alv.
+  ENDIF.
+
+*---------------------------------------------------------------------*
+* Form get_data
+* Collects base data, stock, best vendor per MATNR/WERKS, and composes ALV.
+*---------------------------------------------------------------------*
+FORM get_data.
+  DATA: lv_today       TYPE sy-datum.
+  lv_today = sy-datum.
+
+  "1) Base set: Materials x Plants with optional Material Type
+  SELECT a~matnr,
+         a~werks,
+         b~mtart,
+         b~meins,
+         t~maktx,
+         w~name1 AS plant_name
+    FROM marc AS a
+    INNER JOIN mara AS b ON b~matnr = a~matnr
+    LEFT OUTER JOIN makt AS t ON t~matnr = b~matnr AND t~spras = @sy-langu
+    LEFT OUTER JOIN t001w AS w ON w~werks = a~werks
+    INTO TABLE @gt_base
+    WHERE a~werks IN @s_werks
+      AND a~matnr IN @s_matnr
+      AND ( @s_mtart IS INITIAL OR b~mtart IN @s_mtart ).
+
+  IF gt_base IS INITIAL.
+    RETURN.
+  ENDIF.
+
+  SORT gt_base BY matnr werks.
+
+  "2) Stock totals from MARD per MATNR/WERKS
+  SELECT matnr,
+         werks,
+         SUM( labst ) AS labst
+    FROM mard
+    FOR ALL ENTRIES IN @gt_base
+    WHERE matnr = @gt_base-matnr
+      AND werks = @gt_base-werks
+    GROUP BY matnr, werks
+    INTO TABLE @gt_stock.
+
+  "3) Source list (EORD) for vendor determination
+  IF s_lifnr[] IS INITIAL.
+    SELECT matnr,
+           werks,
+           lifnr,
+           fixkz,
+           datab,
+           datbi
+      FROM eord
+      FOR ALL ENTRIES IN @gt_base
+      WHERE matnr = @gt_base-matnr
+        AND werks = @gt_base-werks
+      INTO TABLE @gt_eord.
+  ELSE.
+    SELECT matnr,
+           werks,
+           lifnr,
+           fixkz,
+           datab,
+           datbi
+      FROM eord
+      FOR ALL ENTRIES IN @gt_base
+      WHERE matnr = @gt_base-matnr
+        AND werks = @gt_base-werks
+        AND lifnr IN @s_lifnr
+      INTO TABLE @gt_eord.
+  ENDIF.
+
+  "Determine best vendor per MATNR/WERKS using simple scoring:
+  " +3 if valid today, +2 if fixed source; tie-breaker by latest end date.
+  CLEAR gt_vmap.
+
+  DATA: lt_keys          TYPE SORTED TABLE OF ty_base WITH UNIQUE KEY matnr werks,
+        ls_best          TYPE ty_vendor_map,
+        lv_best_score    TYPE i,
+        lv_curr_score    TYPE i,
+        lv_valid         TYPE abap_bool,
+        lv_best_datbi    TYPE eord-datbi.
+
+  lt_keys = gt_base.
+  SORT gt_eord BY matnr werks lifnr datab datbi.
+
+  LOOP AT lt_keys ASSIGNING FIELD-SYMBOL(<ls_key>).
+    CLEAR: lv_best_score, lv_best_datbi, ls_best.
+    LOOP AT gt_eord ASSIGNING FIELD-SYMBOL(<ls_eord>)
+         WHERE matnr = <ls_key>-matnr
+           AND werks = <ls_key>-werks.
+      lv_valid = xsdbool( lv_today >= <ls_eord>-datab AND lv_today <= <ls_eord>-datbi ).
+      lv_curr_score = 0.
+      IF <ls_eord>-fixkz = 'X'.
+        lv_curr_score = lv_curr_score + 2.
+      ENDIF.
+      IF lv_valid = abap_true.
+        lv_curr_score = lv_curr_score + 3.
+      ENDIF.
+
+      IF ls_best-matnr IS INITIAL
+         OR lv_curr_score > lv_best_score
+         OR ( lv_curr_score = lv_best_score AND <ls_eord>-datbi > lv_best_datbi ).
+        lv_best_score = lv_curr_score.
+        lv_best_datbi = <ls_eord>-datbi.
+        ls_best-matnr = <ls_key>-matnr.
+        ls_best-werks = <ls_key>-werks.
+        ls_best-lifnr = <ls_eord>-lifnr.
+      ENDIF.
+    ENDLOOP.
+
+    IF ls_best-matnr IS NOT INITIAL.
+      INSERT ls_best INTO TABLE gt_vmap.
+    ENDIF.
+  ENDLOOP.
+
+  "4) Vendor names (LFA1)
+  IF gt_vmap IS NOT INITIAL.
+    DATA: lt_lifnr TYPE SORTED TABLE OF lfa1-lifnr WITH UNIQUE KEY table_line.
+    LOOP AT gt_vmap ASSIGNING FIELD-SYMBOL(<ls_vmap>).
+      INSERT <ls_vmap>-lifnr INTO TABLE lt_lifnr.
+    ENDLOOP.
+
+    IF lt_lifnr IS NOT INITIAL.
+      SELECT lifnr, name1
+        FROM lfa1
+        INTO TABLE @gt_vend
+        FOR ALL ENTRIES IN @lt_lifnr
+        WHERE lifnr = @lt_lifnr-table_line.
+      "gt_vend is a SORTED table with UNIQUE KEY lifnr; no explicit SORT needed
+    ENDIF.
+  ENDIF.
+
+  "5) Compose ALV output
+  CLEAR gt_alv.
+
+  LOOP AT gt_base ASSIGNING FIELD-SYMBOL(<ls_base>).
+    CLEAR gs_alv.
+    gs_alv-matnr      = <ls_base>-matnr.
+    gs_alv-mtart      = <ls_base>-mtart.
+    gs_alv-maktx      = <ls_base>-maktx.
+    gs_alv-werks      = <ls_base>-werks.
+    gs_alv-plant_name = <ls_base>-plant_name.
+    gs_alv-meins      = <ls_base>-meins.
+
+    READ TABLE gt_vmap ASSIGNING FIELD-SYMBOL(<ls_vmap2>)
+         WITH TABLE KEY matnr = <ls_base>-matnr
+                        werks = <ls_base>-werks.
+    IF sy-subrc = 0.
+      gs_alv-lifnr = <ls_vmap2>-lifnr.
+      READ TABLE gt_vend ASSIGNING FIELD-SYMBOL(<ls_vend>)
+           WITH TABLE KEY lifnr = <ls_vmap2>-lifnr.
+      IF sy-subrc = 0.
+        gs_alv-vendor_name = <ls_vend>-name1.
+      ENDIF.
+    ENDIF.
+
+    READ TABLE gt_stock ASSIGNING FIELD-SYMBOL(<ls_stock>)
+         WITH TABLE KEY matnr = <ls_base>-matnr
+                        werks = <ls_base>-werks.
+    IF sy-subrc = 0.
+      gs_alv-total_stock = <ls_stock>-labst.
+    ENDIF.
+
+    "Apply vendor filter strictly if specified: suppress rows without or mismatching vendor
+    IF s_lifnr[] IS NOT INITIAL.
+      IF gs_alv-lifnr IS INITIAL.
+        CONTINUE.
+      ENDIF.
+      IF gs_alv-lifnr NOT IN s_lifnr.
+        CONTINUE.
+      ENDIF.
+    ENDIF.
+
+    APPEND gs_alv TO gt_alv.
+  ENDLOOP.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* Form display_alv
+* Renders SALV Grid with functions, layout saving, sorting and totals.
+*---------------------------------------------------------------------*
+FORM display_alv.
+  TRY.
+      cl_salv_table=>factory(
+        IMPORTING
+          r_salv_table = go_alv
+        CHANGING
+          t_table      = gt_alv ).
+    CATCH cx_salv_msg INTO DATA(lx_msg).
+      MESSAGE e398(00) WITH lx_msg->get_text( ).
+  ENDTRY.
+
+  "Enable full set of ALV functions (sorting, filtering, totals, export, etc.)
+  go_functions = go_alv->get_functions( ).
+  go_functions->set_all( abap_true ).
+
+  "Allow saving of user-specific layouts
+  go_layout = go_alv->get_layout( ).
+  gs_layout_key-report = sy-repid.
+  gs_layout_key-handle = 'MAT_VEND_STOCK'.
+  go_layout->set_key( gs_layout_key ).
+  go_layout->set_save_restriction( if_salv_c_layout=>restrict_none ).
+  go_layout->set_default( abap_true ).
+
+  "Aggregations for totals/subtotals
+  go_aggr = go_alv->get_aggregations( ).
+  TRY.
+      go_aggr->add_aggregation( 'TOTAL_STOCK' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  "Default sorting with subtotals by Plant and Material
+  go_sorts = go_alv->get_sorts( ).
+  TRY.
+      go_sort_col = go_sorts->add_sort( 'WERKS' ).
+      go_sort_col->set_subtotal( abap_true ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+  TRY.
+      go_sort_col = go_sorts->add_sort( 'MATNR' ).
+      go_sort_col->set_subtotal( abap_true ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  "Column settings and texts
+  go_cols = go_alv->get_columns( ).
+  go_cols->set_optimize( abap_true ).
+
+  TRY.
+      go_col = go_cols->get_column( 'MATNR' ).
+      go_col->set_long_text( 'Material' ).
+      go_col->set_medium_text( 'Material' ).
+      go_col->set_short_text( 'Material' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      go_col = go_cols->get_column( 'MTART' ).
+      go_col->set_long_text( 'Material Type' ).
+      go_col->set_medium_text( 'Mat. Type' ).
+      go_col->set_short_text( 'MTyp' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      go_col = go_cols->get_column( 'MAKTX' ).
+      go_col->set_long_text( 'Material Description' ).
+      go_col->set_medium_text( 'Description' ).
+      go_col->set_short_text( 'Descr.' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      go_col = go_cols->get_column( 'WERKS' ).
+      go_col->set_long_text( 'Plant' ).
+      go_col->set_medium_text( 'Plant' ).
+      go_col->set_short_text( 'Plant' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      go_col = go_cols->get_column( 'PLANT_NAME' ).
+      go_col->set_long_text( 'Plant Name' ).
+      go_col->set_medium_text( 'Plant Name' ).
+      go_col->set_short_text( 'P.Name' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      go_col = go_cols->get_column( 'LIFNR' ).
+      go_col->set_long_text( 'Vendor' ).
+      go_col->set_medium_text( 'Vendor' ).
+      go_col->set_short_text( 'Vendor' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      go_col = go_cols->get_column( 'VENDOR_NAME' ).
+      go_col->set_long_text( 'Vendor Name' ).
+      go_col->set_medium_text( 'Vendor Name' ).
+      go_col->set_short_text( 'V.Name' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      go_col = go_cols->get_column( 'MEINS' ).
+      go_col->set_long_text( 'Base Unit' ).
+      go_col->set_medium_text( 'Base UoM' ).
+      go_col->set_short_text( 'UoM' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  TRY.
+      go_col = go_cols->get_column( 'TOTAL_STOCK' ).
+      go_col->set_long_text( 'Total Stock' ).
+      go_col->set_medium_text( 'Total Stock' ).
+      go_col->set_short_text( 'Stock' ).
+      go_col->set_quantity_column( 'MEINS' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  go_alv->display( ).
+ENDFORM.
+
+
+
+SECTION 2 - CUSTOM OBJECT DEFINITIONS
+No custom objects required for this development.

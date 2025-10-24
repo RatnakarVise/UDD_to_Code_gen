@@ -1,0 +1,301 @@
+* SECTION 1 - ABAP REPORT PROGRAM
+REPORT zmm_mat_vendor_plant_alv.
+
+TYPE-POOLS: slis.
+TYPE-POOLS: lvc.
+
+TABLES: eord, mara, makt, lfa1, t001w.
+
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME.
+  SELECT-OPTIONS:
+    s_matnr FOR mara-matnr,
+    s_werks FOR t001w-werks OBLIGATORY,
+    s_lifnr FOR lfa1-lifnr,
+    s_mtart FOR mara-mtart.
+  PARAMETERS:
+    p_vari TYPE disvariant-variant.
+SELECTION-SCREEN END OF BLOCK b1.
+
+TYPES: BEGIN OF ty_out,
+         matnr       TYPE mara-matnr,
+         maktx       TYPE makt-maktx,
+         mtart       TYPE mara-mtart,
+         werks       TYPE t001w-werks,
+         plant_name  TYPE t001w-name1,
+         lifnr       TYPE lfa1-lifnr,
+         vendor_name TYPE lfa1-name1,
+         count       TYPE i,
+       END OF ty_out.
+
+DATA: gt_out      TYPE STANDARD TABLE OF ty_out WITH DEFAULT KEY,
+      gs_out      TYPE ty_out.
+
+DATA: gt_fieldcat TYPE slis_t_fieldcat_alv,
+      gs_fieldcat TYPE slis_fieldcat_alv,
+      gs_layout   TYPE slis_layout_alv,
+      gt_sort     TYPE slis_t_sortinfo_alv,
+      gs_sort     TYPE slis_sortinfo_alv,
+      gs_variant  TYPE disvariant,
+      gv_title    TYPE lvc_title.
+
+DATA: lt_eord     TYPE STANDARD TABLE OF eord WITH DEFAULT KEY,
+      ls_eord     TYPE eord,
+      lt_mara     TYPE STANDARD TABLE OF mara,
+      lt_makt     TYPE STANDARD TABLE OF makt,
+      lt_lfa1     TYPE STANDARD TABLE OF lfa1,
+      lt_t001w    TYPE STANDARD TABLE OF t001w.
+
+DATA: lt_mara_h   TYPE HASHED TABLE OF mara WITH UNIQUE KEY matnr,
+      lt_makt_h   TYPE HASHED TABLE OF makt WITH UNIQUE KEY matnr spras,
+      lt_lfa1_h   TYPE HASHED TABLE OF lfa1 WITH UNIQUE KEY lifnr,
+      lt_t001w_h  TYPE HASHED TABLE OF t001w WITH UNIQUE KEY werks.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_vari.
+  PERFORM variant_f4 CHANGING p_vari.
+
+AT SELECTION-SCREEN.
+  IF s_werks[] IS INITIAL.
+    MESSAGE 'Plant range (S_WERKS) is mandatory.' TYPE 'E'.
+  ENDIF.
+
+START-OF-SELECTION.
+  PERFORM fetch_data.
+  IF gt_out IS INITIAL.
+    MESSAGE 'No data found for given selection.' TYPE 'S' DISPLAY LIKE 'E'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+  PERFORM build_fieldcat.
+  PERFORM display_alv.
+
+FORM variant_f4 CHANGING p_variant TYPE disvariant-variant.
+  CLEAR gs_variant.
+  gs_variant-report  = sy-repid.
+  gs_variant-variant = p_variant.
+  CALL FUNCTION 'REUSE_ALV_VARIANT_F4'
+    EXPORTING
+      is_variant = gs_variant
+      i_save     = 'A'
+    IMPORTING
+      es_variant = gs_variant
+    EXCEPTIONS
+      not_found      = 1
+      program_error  = 2
+      others         = 3.
+  IF sy-subrc = 0.
+    p_variant = gs_variant-variant.
+  ENDIF.
+ENDFORM.
+
+FORM fetch_data.
+  " 1) Get EORD by Plant (mandatory); other filters handled later
+  SELECT matnr, werks, lifnr
+    FROM eord
+    INTO TABLE @lt_eord
+    WHERE werks IN @s_werks.
+  IF sy-subrc <> 0 OR lt_eord IS INITIAL.
+    RETURN.
+  ENDIF.
+
+  " 2) MARA by MATNR from EORD with optional MTART filter
+  IF s_mtart[] IS INITIAL.
+    SELECT matnr, mtart
+      FROM mara
+      INTO TABLE @lt_mara
+      FOR ALL ENTRIES IN @lt_eord
+      WHERE matnr = @lt_eord-matnr.
+  ELSE.
+    SELECT matnr, mtart
+      FROM mara
+      INTO TABLE @lt_mara
+      FOR ALL ENTRIES IN @lt_eord
+      WHERE matnr = @lt_eord-matnr
+        AND mtart IN @s_mtart.
+  ENDIF.
+
+  IF lt_mara IS INITIAL.
+    RETURN.
+  ENDIF.
+
+  " 3) MAKT descriptions in logon language
+  SELECT matnr, spras, maktx
+    FROM makt
+    INTO TABLE @lt_makt
+    FOR ALL ENTRIES IN @lt_mara
+    WHERE matnr = @lt_mara-matnr
+      AND spras = @sy-langu.
+
+  " 4) LFA1 vendors from EORD
+  SELECT lifnr, name1
+    FROM lfa1
+    INTO TABLE @lt_lfa1
+    FOR ALL ENTRIES IN @lt_eord
+    WHERE lifnr = @lt_eord-lifnr.
+
+  " 5) T001W plants from EORD
+  SELECT werks, name1
+    FROM t001w
+    INTO TABLE @lt_t001w
+    FOR ALL ENTRIES IN @lt_eord
+    WHERE werks = @lt_eord-werks.
+
+  " Convert to hashed for fast lookups
+  lt_mara_h  = lt_mara.
+  lt_makt_h  = lt_makt.
+  lt_lfa1_h  = lt_lfa1.
+  lt_t001w_h = lt_t001w.
+
+  " 6) Build output applying remaining filters (MATNR, LIFNR ranges)
+  CLEAR gt_out.
+  LOOP AT lt_eord INTO ls_eord.
+    " Apply optional material range
+    IF NOT s_matnr[] IS INITIAL AND ls_eord-matnr NOT IN s_matnr.
+      CONTINUE.
+    ENDIF.
+    " Apply optional vendor range
+    IF NOT s_lifnr[] IS INITIAL AND ls_eord-lifnr NOT IN s_lifnr.
+      CONTINUE.
+    ENDIF.
+
+    " Filter by MTART through MARA presence from step 2
+    DATA(ls_mara) = VALUE mara( ).
+    READ TABLE lt_mara_h INTO ls_mara WITH TABLE KEY matnr = ls_eord-matnr.
+    IF sy-subrc <> 0.
+      CONTINUE.
+    ENDIF.
+
+    DATA(ls_makt) = VALUE makt( ).
+    READ TABLE lt_makt_h INTO ls_makt WITH TABLE KEY matnr = ls_eord-matnr spras = sy-langu.
+
+    DATA(ls_lfa1) = VALUE lfa1( ).
+    READ TABLE lt_lfa1_h INTO ls_lfa1 WITH TABLE KEY lifnr = ls_eord-lifnr.
+
+    DATA(ls_t001w) = VALUE t001w( ).
+    READ TABLE lt_t001w_h INTO ls_t001w WITH TABLE KEY werks = ls_eord-werks.
+
+    CLEAR gs_out.
+    gs_out-matnr       = ls_eord-matnr.
+    gs_out-maktx       = ls_makt-maktx.
+    gs_out-mtart       = ls_mara-mtart.
+    gs_out-werks       = ls_eord-werks.
+    gs_out-plant_name  = ls_t001w-name1.
+    gs_out-lifnr       = ls_eord-lifnr.
+    gs_out-vendor_name = ls_lfa1-name1.
+    gs_out-count       = 1.
+
+    APPEND gs_out TO gt_out.
+  ENDLOOP.
+ENDFORM.
+
+FORM build_fieldcat.
+  CLEAR gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname     = 'MATNR'.
+  gs_fieldcat-ref_tabname   = 'MARA'.
+  gs_fieldcat-ref_fieldname = 'MATNR'.
+  gs_fieldcat-seltext_l     = 'Material'.
+  gs_fieldcat-key           = 'X'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname     = 'MAKTX'.
+  gs_fieldcat-ref_tabname   = 'MAKT'.
+  gs_fieldcat-ref_fieldname = 'MAKTX'.
+  gs_fieldcat-seltext_l     = 'Material Description'.
+  gs_fieldcat-outputlen     = 40.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname     = 'MTART'.
+  gs_fieldcat-ref_tabname   = 'MARA'.
+  gs_fieldcat-ref_fieldname = 'MTART'.
+  gs_fieldcat-seltext_l     = 'Material Type'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname     = 'WERKS'.
+  gs_fieldcat-ref_tabname   = 'T001W'.
+  gs_fieldcat-ref_fieldname = 'WERKS'.
+  gs_fieldcat-seltext_l     = 'Plant'.
+  gs_fieldcat-key           = 'X'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname     = 'PLANT_NAME'.
+  gs_fieldcat-ref_tabname   = 'T001W'.
+  gs_fieldcat-ref_fieldname = 'NAME1'.
+  gs_fieldcat-seltext_l     = 'Plant Name'.
+  gs_fieldcat-outputlen     = 30.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname     = 'LIFNR'.
+  gs_fieldcat-ref_tabname   = 'LFA1'.
+  gs_fieldcat-ref_fieldname = 'LIFNR'.
+  gs_fieldcat-seltext_l     = 'Vendor'.
+  gs_fieldcat-key           = 'X'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname     = 'VENDOR_NAME'.
+  gs_fieldcat-ref_tabname   = 'LFA1'.
+  gs_fieldcat-ref_fieldname = 'NAME1'.
+  gs_fieldcat-seltext_l     = 'Vendor Name'.
+  gs_fieldcat-outputlen     = 30.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname     = 'COUNT'.
+  gs_fieldcat-seltext_l     = 'Count'.
+  gs_fieldcat-do_sum        = 'X'.
+  gs_fieldcat-outputlen     = 10.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gt_sort.
+  CLEAR gs_sort.
+  gs_sort-fieldname = 'WERKS'.
+  gs_sort-up        = 'X'.
+  gs_sort-subtot    = 'X'.
+  APPEND gs_sort TO gt_sort.
+
+  CLEAR gs_sort.
+  gs_sort-fieldname = 'LIFNR'.
+  gs_sort-up        = 'X'.
+  gs_sort-subtot    = 'X'.
+  APPEND gs_sort TO gt_sort.
+
+  CLEAR gs_layout.
+  gs_layout-zebra      = 'X'.
+  gs_layout-cwidth_opt = 'X'.
+  gs_layout-detail_popup = 'X'.
+
+  gv_title = |Material-Vendor by Plant|.
+ENDFORM.
+
+FORM display_alv.
+  CLEAR gs_variant.
+  gs_variant-report  = sy-repid.
+  gs_variant-variant = p_vari.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program = sy-repid
+      is_layout          = gs_layout
+      it_fieldcat        = gt_fieldcat
+      it_sort            = gt_sort
+      i_save             = 'A'
+      is_variant         = gs_variant
+      i_grid_title       = gv_title
+      i_default          = 'X'
+    TABLES
+      t_outtab           = gt_out
+    EXCEPTIONS
+      program_error      = 1
+      others             = 2.
+  IF sy-subrc <> 0.
+    MESSAGE 'ALV display error occurred.' TYPE 'S' DISPLAY LIKE 'E'.
+  ENDIF.
+ENDFORM.
+
+* SECTION 2 - CUSTOM OBJECT DEFINITIONS
+* No custom objects mentioned.

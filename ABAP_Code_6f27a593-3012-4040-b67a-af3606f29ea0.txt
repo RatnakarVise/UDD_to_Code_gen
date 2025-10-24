@@ -1,0 +1,260 @@
+REPORT zmm_mat_plant_vendor_alv.
+
+*-------------------------------------------------------------*
+* Type Pools
+*-------------------------------------------------------------*
+TYPE-POOLS: slis, lvc.
+
+*-------------------------------------------------------------*
+* Types
+*-------------------------------------------------------------*
+TYPES: BEGIN OF ty_alv,
+         matnr       TYPE mara-matnr,      "Material
+         maktx       TYPE makt-maktx,      "Material Description
+         mtart       TYPE mara-mtart,      "Material Type
+         meins       TYPE mara-meins,      "Base Unit
+         matkl       TYPE mara-matkl,      "Material Group
+         werks       TYPE marc-werks,      "Plant
+         plant_name  TYPE t001w-name1,     "Plant Name
+         lifnr       TYPE lfa1-lifnr,      "Vendor
+         name1       TYPE lfa1-name1,      "Vendor Name
+         vdatu       TYPE eord-vdatu,      "Valid From (Source List)
+         bdatu       TYPE eord-bdatu,      "Valid To   (Source List)
+         rec_cnt     TYPE i,               "Row Count for subtotals/totals
+       END OF ty_alv.
+
+*-------------------------------------------------------------*
+* Data Declarations
+*-------------------------------------------------------------*
+DATA: lt_alv      TYPE STANDARD TABLE OF ty_alv WITH DEFAULT KEY.
+
+DATA: lt_fcat     TYPE lvc_t_fcat,
+      ls_fcat     TYPE lvc_s_fcat,
+      ls_layout   TYPE lvc_s_layo,
+      lt_sort     TYPE lvc_t_sort,
+      ls_sort     TYPE lvc_s_sort,
+      ls_variant  TYPE disvariant.
+
+DATA: lv_repid    TYPE sy-repid VALUE sy-repid,
+      lv_title    TYPE sy-title.
+
+*-------------------------------------------------------------*
+* Selection Screen
+*-------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-t01.
+SELECT-OPTIONS:
+  s_matnr FOR mara-matnr NO INTERVALS,
+  s_werks FOR marc-werks OBLIGATORY,
+  s_lifnr FOR lfa1-lifnr,
+  s_mtart FOR mara-mtart NO INTERVALS.
+PARAMETERS: p_var  TYPE disvariant-variant.
+SELECTION-SCREEN END OF BLOCK b1.
+
+* Text elements
+* text-t01: Selection Criteria
+
+*-------------------------------------------------------------*
+* Events
+*-------------------------------------------------------------*
+INITIALIZATION.
+  lv_title = 'Material/Plant/Vendor Overview (ALV)'.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_var.
+  PERFORM f4_layout_variant CHANGING p_var.
+
+START-OF-SELECTION.
+  PERFORM get_data.
+  IF lt_alv IS INITIAL.
+    MESSAGE 'No data found for given selection' TYPE 'S'.
+    EXIT.
+  ENDIF.
+
+  PERFORM build_fieldcatalog.
+  PERFORM build_sort.
+  PERFORM set_layout.
+  PERFORM display_alv.
+
+*-------------------------------------------------------------*
+* Form Routines
+*-------------------------------------------------------------*
+FORM f4_layout_variant CHANGING p_variant TYPE disvariant-variant.
+* F4 help for layout variant
+  DATA: ls_var_f4 TYPE disvariant.
+
+  ls_var_f4-report = lv_repid.
+
+  CALL FUNCTION 'REUSE_ALV_VARIANT_F4'
+    EXPORTING
+      is_variant = ls_var_f4
+      i_save     = 'A'
+    IMPORTING
+      es_variant = ls_var_f4
+    EXCEPTIONS
+      not_found  = 2
+      OTHERS     = 4.
+
+  IF sy-subrc = 0.
+    p_variant = ls_var_f4-variant.
+  ENDIF.
+ENDFORM.
+
+FORM get_data.
+* Fetch material/plant/vendor/source list data
+  CLEAR lt_alv.
+
+  SELECT mara~matnr
+         makt~maktx
+         mara~mtart
+         mara~meins
+         mara~matkl
+         marc~werks
+         t001w~name1 AS plant_name
+         eord~lifnr
+         lfa1~name1
+         eord~vdatu
+         eord~bdatu
+    FROM marc
+    INNER JOIN mara
+      ON mara~matnr = marc~matnr
+    LEFT OUTER JOIN makt
+      ON makt~matnr = mara~matnr
+     AND makt~spras = @sy-langu
+    LEFT OUTER JOIN t001w
+      ON t001w~werks = marc~werks
+    LEFT OUTER JOIN eord
+      ON eord~matnr = marc~matnr
+     AND eord~werks = marc~werks
+    LEFT OUTER JOIN lfa1
+      ON lfa1~lifnr = eord~lifnr
+    INTO TABLE @lt_alv
+    WHERE marc~werks IN @s_werks
+      AND mara~matnr IN @s_matnr
+      AND mara~mtart IN @s_mtart.
+
+  IF sy-subrc <> 0.
+    RETURN.
+  ENDIF.
+
+  "Apply vendor filter if provided
+  IF s_lifnr[] IS NOT INITIAL.
+    DELETE lt_alv WHERE lifnr IS INITIAL OR lifnr NOT IN s_lifnr.
+  ENDIF.
+
+  "Set record counter to enable totals/subtotals
+  LOOP AT lt_alv ASSIGNING FIELD-SYMBOL(<ls_alv>).
+    <ls_alv>-rec_cnt = 1.
+  ENDLOOP.
+ENDFORM.
+
+FORM build_fieldcatalog.
+* Build ALV field catalog
+  CLEAR lt_fcat.
+
+  PERFORM add_fcat USING 'MATNR'       'Material'        'X' 18  ''  ''  ''  ''  ''.
+  PERFORM add_fcat USING 'WERKS'       'Plant'           'X'  4  ''  ''  ''  ''  ''.
+  PERFORM add_fcat USING 'LIFNR'       'Vendor'          'X' 10  ''  ''  ''  ''  ''.
+  PERFORM add_fcat USING 'MAKTX'       'Material Desc.'  ''  40  ''  ''  ''  ''  ''.
+  PERFORM add_fcat USING 'MTART'       'Material Type'   ''  10  ''  ''  ''  ''  ''.
+  PERFORM add_fcat USING 'MEINS'       'Base UoM'        ''   5  ''  ''  ''  ''  ''.
+  PERFORM add_fcat USING 'MATKL'       'Material Group'  ''   9  ''  ''  ''  ''  ''.
+  PERFORM add_fcat USING 'PLANT_NAME'  'Plant Name'      ''  25  ''  ''  ''  ''  ''.
+  PERFORM add_fcat USING 'NAME1'       'Vendor Name'     ''  35  ''  ''  ''  ''  ''.
+  PERFORM add_fcat USING 'VDATU'       'Valid From'      ''  10  ''  ''  ''  ''  ''.
+  PERFORM add_fcat USING 'BDATU'       'Valid To'        ''  10  ''  ''  ''  ''  ''.
+
+  "Counter for totals/subtotals
+  CLEAR ls_fcat.
+  ls_fcat-fieldname = 'REC_CNT'.
+  ls_fcat-coltext   = 'Count'.
+  ls_fcat-scrtext_l = 'Count'.
+  ls_fcat-scrtext_m = 'Count'.
+  ls_fcat-scrtext_s = 'Cnt'.
+  ls_fcat-just      = 'R'.
+  ls_fcat-outputlen = 8.
+  ls_fcat-do_sum    = 'X'.
+  APPEND ls_fcat TO lt_fcat.
+ENDFORM.
+
+FORM add_fcat USING    p_fieldname TYPE lvc_fname
+                        p_coltext   TYPE scrtext_l
+                        p_key       TYPE c
+                        p_outlen    TYPE i
+                        p_ref_tab   TYPE tabname
+                        p_ref_fld   TYPE fieldname
+                        p_qfield    TYPE lvc_fname
+                        p_cfield    TYPE lvc_fname
+                        p_no_out    TYPE c.
+* Helper to append a single field to the field catalog
+  CLEAR ls_fcat.
+  ls_fcat-fieldname  = p_fieldname.
+  ls_fcat-coltext    = p_coltext.
+  ls_fcat-scrtext_l  = p_coltext.
+  ls_fcat-scrtext_m  = p_coltext.
+  ls_fcat-scrtext_s  = p_coltext.
+  ls_fcat-key        = p_key.
+  ls_fcat-outputlen  = p_outlen.
+  ls_fcat-ref_table  = p_ref_tab.
+  ls_fcat-ref_field  = p_ref_fld.
+  ls_fcat-qfieldname = p_qfield.
+  ls_fcat-cfieldname = p_cfield.
+  ls_fcat-no_out     = p_no_out.
+  APPEND ls_fcat TO lt_fcat.
+ENDFORM.
+
+FORM build_sort.
+* Define sort order and subtotals
+  CLEAR lt_sort.
+
+  CLEAR ls_sort.
+  ls_sort-fieldname = 'WERKS'.
+  ls_sort-up        = 'X'.
+  ls_sort-subtot    = 'X'.
+  APPEND ls_sort TO lt_sort.
+
+  CLEAR ls_sort.
+  ls_sort-fieldname = 'MATNR'.
+  ls_sort-up        = 'X'.
+  ls_sort-subtot    = 'X'.
+  APPEND ls_sort TO lt_sort.
+
+  CLEAR ls_sort.
+  ls_sort-fieldname = 'LIFNR'.
+  ls_sort-up        = 'X'.
+  APPEND ls_sort TO lt_sort.
+ENDFORM.
+
+FORM set_layout.
+* Configure ALV layout
+  CLEAR ls_layout.
+  ls_layout-zebra      = 'X'.
+  ls_layout-cwidth_opt = 'X'.
+  ls_layout-sel_mode   = 'A'.
+  ls_layout-grid_title = lv_title.
+  ls_layout-col_opt    = 'X'.
+ENDFORM.
+
+FORM display_alv.
+* Display ALV Grid
+  CLEAR ls_variant.
+  ls_variant-report  = lv_repid.
+  ls_variant-variant = p_var.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY_LVC'
+    EXPORTING
+      i_callback_program = lv_repid
+      is_variant         = ls_variant
+      i_save             = 'A'
+      is_layout_lvc      = ls_layout
+      it_sort_lvc        = lt_sort
+    TABLES
+      t_outtab           = lt_alv
+      t_fieldcat_lvc     = lt_fcat
+    EXCEPTIONS
+      program_error      = 1
+      OTHERS             = 2.
+
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+ENDFORM.

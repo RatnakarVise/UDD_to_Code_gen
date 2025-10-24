@@ -1,0 +1,583 @@
+REPORT zmm_po_close NO STANDARD PAGE HEADING.
+
+*---------------------------------------------------------------------*
+* Type Pools
+*---------------------------------------------------------------------*
+TYPE-POOLS: icon, cntb.
+
+*---------------------------------------------------------------------*
+* Constants
+*---------------------------------------------------------------------*
+CONSTANTS: gc_func_close TYPE syucomm VALUE 'ZCLOSE',         "ALV toolbar: Close
+           gc_func_refr  TYPE syucomm VALUE 'ZREFR'.          "ALV toolbar: Refresh
+CONSTANTS: gc_b1_title   TYPE c LENGTH 60 VALUE 'Selection Criteria',
+           gc_scn_cmt    TYPE c LENGTH 60 VALUE 'Utility to display and close open PO items (sets EKPO-ELIKZ = X)'.
+
+*---------------------------------------------------------------------*
+* Selection Screen
+*---------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE gc_b1_title.
+SELECT-OPTIONS: s_matnr FOR mara-matnr,
+                s_werks FOR ekpo-werks OBLIGATORY,
+                s_lifnr FOR ekko-lifnr,
+                s_mtart FOR mara-mtart.
+SELECTION-SCREEN END OF BLOCK b1.
+
+SELECTION-SCREEN COMMENT /1(60) gc_scn_cmt.
+
+*---------------------------------------------------------------------*
+* Types
+*---------------------------------------------------------------------*
+TYPES: BEGIN OF ty_alv,
+         ebeln         TYPE ekpo-ebeln,        "PO Number
+         ebelp         TYPE ekpo-ebelp,        "Item
+         lifnr         TYPE ekko-lifnr,        "Vendor
+         name1         TYPE lfa1-name1,        "Vendor Name
+         bedat         TYPE ekko-bedat,        "PO Date
+         bsart         TYPE ekko-bsart,        "Document Type
+         matnr         TYPE ekpo-matnr,        "Material
+         mtart         TYPE mara-mtart,        "Material Type
+         txz01         TYPE ekpo-txz01,        "Short Text
+         werks         TYPE ekpo-werks,        "Plant
+         meins         TYPE ekpo-meins,        "UoM
+         menge         TYPE ekpo-menge,        "Order Qty
+         wemng         TYPE ekpo-wemng,        "GR Qty
+         open_qty      TYPE ekpo-menge,        "Open Qty (calc)
+         elikz         TYPE ekpo-elikz,        "Delivery Completed
+         next_eindt    TYPE eket-eindt,        "Next Schedule Date
+         sl_count      TYPE i,                 "Schedule Line Count
+       END OF ty_alv.
+TYPES: ty_t_alv TYPE STANDARD TABLE OF ty_alv WITH NON-UNIQUE KEY ebeln ebelp.
+
+TYPES: BEGIN OF ty_ekko,
+         ebeln TYPE ekko-ebeln,
+         lifnr TYPE ekko-lifnr,
+         bedat TYPE ekko-bedat,
+         bsart TYPE ekko-bsart,
+       END OF ty_ekko.
+TYPES: ty_t_ekko TYPE HASHED TABLE OF ty_ekko WITH UNIQUE KEY ebeln.
+
+TYPES: BEGIN OF ty_lfa1,
+         lifnr TYPE lfa1-lifnr,
+         name1 TYPE lfa1-name1,
+       END OF ty_lfa1.
+TYPES: ty_t_lfa1 TYPE HASHED TABLE OF ty_lfa1 WITH UNIQUE KEY lifnr.
+
+TYPES: BEGIN OF ty_mara,
+         matnr TYPE mara-matnr,
+         mtart TYPE mara-mtart,
+       END OF ty_mara.
+TYPES: ty_t_mara TYPE HASHED TABLE OF ty_mara WITH UNIQUE KEY matnr.
+
+TYPES: BEGIN OF ty_eket_agg,
+         ebeln      TYPE eket-ebeln,
+         ebelp      TYPE eket-ebelp,
+         next_eindt TYPE eket-eindt,
+         sl_count   TYPE i,
+       END OF ty_eket_agg.
+TYPES: ty_t_eket_agg TYPE HASHED TABLE OF ty_eket_agg WITH UNIQUE KEY ebeln ebelp.
+
+TYPES: ty_r_matnr TYPE RANGE OF mara-matnr.
+TYPES: ty_r_ebeln TYPE RANGE OF ekko-ebeln.
+
+*---------------------------------------------------------------------*
+* Data
+*---------------------------------------------------------------------*
+DATA: gt_alv       TYPE ty_t_alv,
+      gs_alv       TYPE ty_alv.
+
+DATA: gt_fieldcat  TYPE lvc_t_fcat,
+      gs_layout    TYPE lvc_s_layo,
+      gs_variant   TYPE disvariant,
+      gt_sort      TYPE lvc_t_sort.
+
+DATA: go_container TYPE REF TO cl_gui_custom_container,
+      go_grid      TYPE REF TO cl_gui_alv_grid.
+
+DATA: gv_okcode    TYPE sy-ucomm,
+      gv_refresh   TYPE abap_bool.
+
+DATA: gv_msg       TYPE string.
+
+DATA: gt_r_matnr   TYPE ty_r_matnr,
+      gt_r_ebeln   TYPE ty_r_ebeln.
+
+DATA: gt_ekko_h    TYPE ty_t_ekko,
+      gt_lfa1_h    TYPE ty_t_lfa1,
+      gt_mara_h    TYPE ty_t_mara,
+      gt_eket_h    TYPE ty_t_eket_agg.
+
+DATA: gv_repid     TYPE sy-repid VALUE sy-repid.
+
+*---------------------------------------------------------------------*
+* Local Event Handler
+*---------------------------------------------------------------------*
+CLASS lcl_event_handler DEFINITION.
+  PUBLIC SECTION.
+    METHODS on_toolbar
+      FOR EVENT toolbar OF cl_gui_alv_grid
+      IMPORTING e_object e_interactive.
+    METHODS on_user_command
+      FOR EVENT user_command OF cl_gui_alv_grid
+      IMPORTING e_ucomm.
+ENDCLASS.
+
+CLASS lcl_event_handler IMPLEMENTATION.
+  METHOD on_toolbar.
+    "Build custom toolbar buttons (separator, Close, Refresh)
+    DATA ls_button TYPE stb_button.
+
+    CLEAR ls_button.
+    ls_button-butn_type = cntb_btype_sep.
+    APPEND ls_button TO e_object->mt_toolbar.
+
+    CLEAR ls_button.
+    ls_button-function  = gc_func_close.
+    ls_button-icon      = icon_lock.
+    ls_button-quickinfo = 'Close Selected Items (Set ELIKZ = X)'.
+    ls_button-text      = 'Close Items'.
+    APPEND ls_button TO e_object->mt_toolbar.
+
+    CLEAR ls_button.
+    ls_button-function  = gc_func_refr.
+    ls_button-icon      = icon_refresh.
+    ls_button-quickinfo = 'Refresh Data'.
+    ls_button-text      = 'Refresh'.
+    APPEND ls_button TO e_object->mt_toolbar.
+  ENDMETHOD.
+
+  METHOD on_user_command.
+    "React to custom toolbar actions
+    CASE e_ucomm.
+      WHEN gc_func_close.
+        PERFORM close_selected_items.
+      WHEN gc_func_refr.
+        gv_refresh = abap_true.
+        PERFORM get_data.
+        PERFORM refresh_alv.
+      WHEN OTHERS.
+        "No action
+    ENDCASE.
+  ENDMETHOD.
+ENDCLASS.
+
+DATA go_handler TYPE REF TO lcl_event_handler.
+
+*---------------------------------------------------------------------*
+* Selection-Screen Events
+*---------------------------------------------------------------------*
+AT SELECTION-SCREEN.
+  "Validate mandatory plant
+  IF s_werks[] IS INITIAL.
+    MESSAGE e398(00) WITH 'Please provide at least one Plant (S_WERKS is mandatory).'.
+  ENDIF.
+
+*---------------------------------------------------------------------*
+* Start-of-selection
+*---------------------------------------------------------------------*
+START-OF-SELECTION.
+  "Build filters and fetch initial data
+  PERFORM build_filters.
+  PERFORM get_data.
+
+  IF gt_alv IS INITIAL.
+    MESSAGE s398(00) WITH 'No open PO items found for the given criteria.'.
+    EXIT.
+  ENDIF.
+
+  "Display main screen with ALV
+  CALL SCREEN 0100.
+
+*---------------------------------------------------------------------*
+* Screen 0100 Flow Logic (create Custom Control CC_ALV in Screen Painter)
+* PROCESS BEFORE OUTPUT.
+*   MODULE status_0100.
+* PROCESS AFTER INPUT.
+*   MODULE user_command_0100.
+*---------------------------------------------------------------------*
+
+MODULE status_0100 OUTPUT.
+  "Build or refresh ALV on PBO
+  PERFORM build_alv.
+ENDMODULE.
+
+MODULE user_command_0100 INPUT.
+  "Handle generic GUI functions
+  CASE gv_okcode.
+    WHEN 'BACK' OR 'CANC' OR 'EXIT'.
+      LEAVE TO SCREEN 0.
+    WHEN OTHERS.
+      "No action
+  ENDCASE.
+  CLEAR gv_okcode.
+ENDMODULE.
+
+*---------------------------------------------------------------------*
+* Forms
+*---------------------------------------------------------------------*
+
+FORM build_filters.
+  "Build filter ranges for materials and POs based on selection
+  DATA lt_mara_list TYPE STANDARD TABLE OF mara-matnr WITH EMPTY KEY.
+
+  CLEAR gt_r_matnr.
+
+  IF s_mtart[] IS NOT INITIAL AND s_matnr[] IS NOT INITIAL.
+    "Intersection of material type and material numbers
+    SELECT matnr
+      FROM mara
+      INTO TABLE lt_mara_list
+      WHERE mtart IN s_mtart
+        AND matnr IN s_matnr.
+  ELSEIF s_mtart[] IS NOT INITIAL.
+    "All materials by selected types
+    SELECT matnr
+      FROM mara
+      INTO TABLE lt_mara_list
+      WHERE mtart IN s_mtart.
+  ELSEIF s_matnr[] IS NOT INITIAL.
+    "Use provided material numbers directly
+    gt_r_matnr[] = s_matnr[].
+  ENDIF.
+
+  IF lt_mara_list IS NOT INITIAL.
+    SORT lt_mara_list.
+    DELETE ADJACENT DUPLICATES FROM lt_mara_list.
+    LOOP AT lt_mara_list ASSIGNING FIELD-SYMBOL(<lv_matnr>).
+      APPEND VALUE #( sign = 'I' option = 'EQ' low = <lv_matnr> ) TO gt_r_matnr.
+    ENDLOOP.
+  ENDIF.
+
+  "Build PO number range if vendor filter is provided
+  CLEAR gt_r_ebeln.
+  IF s_lifnr[] IS NOT INITIAL.
+    DATA lt_ekko_ebeln TYPE STANDARD TABLE OF ekko-ebeln WITH EMPTY KEY.
+    SELECT ebeln
+      FROM ekko
+      INTO TABLE lt_ekko_ebeln
+      WHERE lifnr IN s_lifnr.
+    IF sy-subrc = 0.
+      SORT lt_ekko_ebeln.
+      DELETE ADJACENT DUPLICATES FROM lt_ekko_ebeln.
+      LOOP AT lt_ekko_ebeln ASSIGNING FIELD-SYMBOL(<lv_ebeln>).
+        APPEND VALUE #( sign = 'I' option = 'EQ' low = <lv_ebeln> ) TO gt_r_ebeln.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+ENDFORM.
+
+FORM get_data.
+  "Fetch data for ALV: EKPO items, EKKO header, vendor, material, and EKET aggregates
+  CLEAR: gt_alv, gt_ekko_h, gt_lfa1_h, gt_mara_h, gt_eket_h.
+
+  "1) Read open EKPO items in plants and optional filters
+  DATA lt_ekpo TYPE STANDARD TABLE OF ekpo WITH EMPTY KEY.
+  SELECT ebeln ebelp matnr txz01 werks menge meins wemng elikz
+    FROM ekpo
+    INTO CORRESPONDING FIELDS OF TABLE lt_ekpo
+    WHERE werks IN s_werks
+      AND elikz = @space
+      AND ( @gt_r_matnr IS INITIAL OR matnr IN @gt_r_matnr )
+      AND ( @gt_r_ebeln IS INITIAL OR ebeln IN @gt_r_ebeln ).
+  IF lt_ekpo IS INITIAL.
+    RETURN.
+  ENDIF.
+
+  "2) Header data from EKKO
+  SELECT ebeln lifnr bedat bsart
+    FROM ekko
+    INTO TABLE gt_ekko_h
+    FOR ALL ENTRIES IN @lt_ekpo
+    WHERE ebeln = @lt_ekpo-ebeln.
+  IF sy-subrc = 0.
+    SORT gt_ekko_h BY ebeln.
+  ENDIF.
+
+  "3) Vendor names from LFA1
+  DATA lt_lifnr TYPE STANDARD TABLE OF lfa1-lifnr WITH EMPTY KEY.
+  IF gt_ekko_h IS NOT INITIAL.
+    lt_lifnr = VALUE #( FOR ls_ekko IN gt_ekko_h ( ls_ekko-lifnr ) ).
+    SORT lt_lifnr.
+    DELETE ADJACENT DUPLICATES FROM lt_lifnr.
+    SELECT lifnr name1
+      FROM lfa1
+      INTO TABLE gt_lfa1_h
+      FOR ALL ENTRIES IN @lt_lifnr
+      WHERE lifnr = @lt_lifnr-table_line.
+    IF sy-subrc = 0.
+      SORT gt_lfa1_h BY lifnr.
+    ENDIF.
+  ENDIF.
+
+  "4) Material types from MARA
+  DATA lt_matnr TYPE STANDARD TABLE OF mara-matnr WITH EMPTY KEY.
+  lt_matnr = VALUE #( FOR ls_ekpo IN lt_ekpo WHERE ( matnr IS NOT INITIAL ) ( ls_ekpo-matnr ) ).
+  IF lt_matnr IS NOT INITIAL.
+    SORT lt_matnr.
+    DELETE ADJACENT DUPLICATES FROM lt_matnr.
+    SELECT matnr mtart
+      FROM mara
+      INTO TABLE gt_mara_h
+      FOR ALL ENTRIES IN @lt_matnr
+      WHERE matnr = @lt_matnr-table_line.
+    IF sy-subrc = 0.
+      SORT gt_mara_h BY matnr.
+    ENDIF.
+  ENDIF.
+
+  "5) EKET aggregation: next schedule date and schedule line count per item
+  DATA lt_eket_agg_sql TYPE STANDARD TABLE OF ty_eket_agg WITH EMPTY KEY.
+  SELECT ebeln, ebelp, MIN( eindt ) AS next_eindt, COUNT( * ) AS sl_count
+    FROM eket
+    INTO CORRESPONDING FIELDS OF TABLE @lt_eket_agg_sql
+    FOR ALL ENTRIES IN @lt_ekpo
+    WHERE ebeln = @lt_ekpo-ebeln
+      AND ebelp = @lt_ekpo-ebelp
+    GROUP BY ebeln, ebelp.
+  IF sy-subrc = 0.
+    LOOP AT lt_eket_agg_sql ASSIGNING FIELD-SYMBOL(<ls_agg>).
+      INSERT VALUE ty_eket_agg(
+        ebeln      = <ls_agg>-ebeln
+        ebelp      = <ls_agg>-ebelp
+        next_eindt = <ls_agg>-next_eindt
+        sl_count   = <ls_agg>-sl_count ) INTO TABLE gt_eket_h.
+    ENDLOOP.
+  ENDIF.
+
+  "6) Build ALV dataset by joining buffers
+  DATA: ls_ekko_h TYPE ty_ekko,
+        ls_lfa1_h TYPE ty_lfa1,
+        ls_mara_h TYPE ty_mara,
+        ls_eket_h TYPE ty_eket_agg.
+
+  CLEAR gt_alv.
+
+  LOOP AT lt_ekpo ASSIGNING FIELD-SYMBOL(<ls_ekpo>).
+    CLEAR: ls_ekko_h, ls_lfa1_h, ls_mara_h, ls_eket_h, gs_alv.
+
+    READ TABLE gt_ekko_h INTO ls_ekko_h WITH KEY ebeln = <ls_ekpo>-ebeln.
+    IF sy-subrc = 0.
+      READ TABLE gt_lfa1_h INTO ls_lfa1_h WITH KEY lifnr = ls_ekko_h-lifnr.
+    ENDIF.
+
+    IF <ls_ekpo>-matnr IS NOT INITIAL.
+      READ TABLE gt_mara_h INTO ls_mara_h WITH KEY matnr = <ls_ekpo>-matnr.
+    ENDIF.
+
+    READ TABLE gt_eket_h INTO ls_eket_h WITH KEY ebeln = <ls_ekpo>-ebeln ebelp = <ls_ekpo>-ebelp.
+
+    gs_alv-ebeln      = <ls_ekpo>-ebeln.
+    gs_alv-ebelp      = <ls_ekpo>-ebelp.
+    gs_alv-lifnr      = ls_ekko_h-lifnr.
+    gs_alv-name1      = ls_lfa1_h-name1.
+    gs_alv-bedat      = ls_ekko_h-bedat.
+    gs_alv-bsart      = ls_ekko_h-bsart.
+    gs_alv-matnr      = <ls_ekpo>-matnr.
+    gs_alv-mtart      = ls_mara_h-mtart.
+    gs_alv-txz01      = <ls_ekpo>-txz01.
+    gs_alv-werks      = <ls_ekpo>-werks.
+    gs_alv-meins      = <ls_ekpo>-meins.
+    gs_alv-menge      = <ls_ekpo>-menge.
+    gs_alv-wemng      = <ls_ekpo>-wemng.
+    gs_alv-open_qty   = <ls_ekpo>-menge - <ls_ekpo>-wemng.
+    gs_alv-elikz      = <ls_ekpo>-elikz.
+    gs_alv-next_eindt = ls_eket_h-next_eindt.
+    gs_alv-sl_count   = ls_eket_h-sl_count.
+
+    APPEND gs_alv TO gt_alv.
+  ENDLOOP.
+ENDFORM.
+
+FORM build_alv.
+  "Instantiate container/grid and display ALV (or refresh if requested)
+  IF go_grid IS BOUND AND gv_refresh = abap_true.
+    PERFORM refresh_alv.
+    gv_refresh = abap_false.
+    RETURN.
+  ENDIF.
+
+  IF go_container IS INITIAL.
+    CREATE OBJECT go_container
+      EXPORTING
+        container_name = 'CC_ALV'.
+
+    CREATE OBJECT go_grid
+      EXPORTING
+        i_parent = go_container.
+
+    CREATE OBJECT go_handler.
+
+    SET HANDLER go_handler->on_toolbar      FOR go_grid.
+    SET HANDLER go_handler->on_user_command FOR go_grid.
+  ENDIF.
+
+  PERFORM build_fieldcatalog.
+  PERFORM build_layout.
+
+  gs_variant-report = gv_repid.
+
+  CALL METHOD go_grid->set_table_for_first_display
+    EXPORTING
+      is_layout       = gs_layout
+      is_variant      = gs_variant
+      i_save          = 'A'
+    CHANGING
+      it_outtab       = gt_alv
+      it_fieldcatalog = gt_fieldcat
+      it_sort         = gt_sort.
+
+  "Allow multiple row selection
+  CALL METHOD go_grid->set_selection_mode
+    EXPORTING
+      i_selection_mode = cl_gui_alv_grid=>mc_selection_mode_a.
+
+  "Optimize column widths
+  CALL METHOD go_grid->set_optimize_all_cols
+    EXPORTING
+      i_start_col = 1
+      i_end_col   = 999.
+ENDFORM.
+
+FORM build_fieldcatalog.
+  "Build ALV field catalog and default sorting
+  CLEAR gt_fieldcat.
+
+  DEFINE add_fcat.
+    DATA(ls_fcat) = VALUE lvc_s_fcat(
+      fieldname  = &1
+      coltext    = &2
+      outputlen  = &3
+      key        = &4
+      do_sum     = &5
+      qfieldname = &6
+      cfieldname = &7
+      ref_table  = &8
+      ref_field  = &9
+    ).
+    APPEND ls_fcat TO gt_fieldcat.
+  END-OF-DEFINITION.
+
+  "Key fields
+  add_fcat 'EBELN' 'PO Number'             10 'X' ''  ''      ''     'EKPO' 'EBELN'.
+  add_fcat 'EBELP' 'Item'                   5 'X' ''  ''      ''     'EKPO' 'EBELP'.
+
+  "Header/vendor
+  add_fcat 'LIFNR' 'Vendor'                10 ''  ''  ''      ''     'EKKO' 'LIFNR'.
+  add_fcat 'NAME1' 'Vendor Name'           25 ''  ''  ''      ''     'LFA1' 'NAME1'.
+  add_fcat 'BEDAT' 'PO Date'               10 ''  ''  ''      ''     'EKKO' 'BEDAT'.
+  add_fcat 'BSART' 'Doc Type'               4 ''  ''  ''      ''     'EKKO' 'BSART'.
+
+  "Material
+  add_fcat 'MATNR' 'Material'              18 ''  ''  ''      ''     'EKPO' 'MATNR'.
+  add_fcat 'MTART' 'Material Type'          4 ''  ''  ''      ''     'MARA' 'MTART'.
+  add_fcat 'TXZ01' 'Short Text'            40 ''  ''  ''      ''     'EKPO' 'TXZ01'.
+
+  "Plant
+  add_fcat 'WERKS' 'Plant'                  4 ''  ''  ''      ''     'EKPO' 'WERKS'.
+
+  "Quantities and UoM
+  add_fcat 'MENGE'    'Order Qty'           17 ''  'X' 'MEINS' ''    'EKPO' 'MENGE'.
+  add_fcat 'WEMNG'    'GR Qty'              17 ''  'X' 'MEINS' ''    'EKPO' 'WEMNG'.
+  add_fcat 'OPEN_QTY' 'Open Qty'            17 ''  'X' 'MEINS' ''    ''     ''.
+  add_fcat 'MEINS'    'UoM'                  6 ''  ''  ''      ''    'EKPO' 'MEINS'.
+
+  "Delivery completed indicator
+  add_fcat 'ELIKZ' 'Delivery Completed'      1 ''  ''  ''      ''    'EKPO' 'ELIKZ'.
+
+  "Schedule info
+  add_fcat 'NEXT_EINDT' 'Next Sched. Date'  10 ''  ''  ''      ''    'EKET' 'EINDT'.
+  add_fcat 'SL_COUNT'   'Sched. Lines'       5 ''  ''  ''      ''    ''     ''.
+
+  "Default sorting by PO and Item
+  CLEAR gt_sort.
+  APPEND VALUE lvc_s_sort( fieldname = 'EBELN' up = 'X' ) TO gt_sort.
+  APPEND VALUE lvc_s_sort( fieldname = 'EBELP' up = 'X' ) TO gt_sort.
+ENDFORM.
+
+FORM build_layout.
+  "Set ALV layout options
+  CLEAR gs_layout.
+  gs_layout-zebra      = abap_true.
+  gs_layout-cwidth_opt = abap_true.
+  gs_layout-sel_mode   = 'A'. "Multiple row selection
+ENDFORM.
+
+FORM refresh_alv.
+  "Refresh ALV with stable layout
+  IF go_grid IS BOUND.
+    CALL METHOD go_grid->refresh_table_display
+      EXPORTING
+        is_stable = VALUE lvc_s_stbl( row = 'X' col = 'X' ).
+  ENDIF.
+ENDFORM.
+
+FORM close_selected_items.
+  "Close selected PO items by setting EKPO-ELIKZ = 'X'
+  DATA: lt_row_no    TYPE lvc_t_row,
+        ls_row_no    TYPE lvc_s_row,
+        lt_index     TYPE STANDARD TABLE OF sy-tabix WITH EMPTY KEY,
+        lv_count_ok  TYPE i VALUE 0,
+        lv_count_sk  TYPE i VALUE 0,
+        lv_count_err TYPE i VALUE 0.
+
+  IF go_grid IS NOT BOUND.
+    MESSAGE s398(00) WITH 'ALV Grid not ready.'.
+    RETURN.
+  ENDIF.
+
+  CALL METHOD go_grid->get_selected_rows
+    IMPORTING
+      et_index_rows = lt_row_no.
+
+  IF lt_row_no IS INITIAL.
+    MESSAGE s398(00) WITH 'Please select at least one row to close.'.
+    RETURN.
+  ENDIF.
+
+  LOOP AT lt_row_no INTO ls_row_no.
+    APPEND ls_row_no-index TO lt_index.
+  ENDLOOP.
+  SORT lt_index.
+  DELETE ADJACENT DUPLICATES FROM lt_index.
+
+  DATA ls_key TYPE ty_alv.
+
+  LOOP AT lt_index ASSIGNING FIELD-SYMBOL(<lv_idx>).
+    READ TABLE gt_alv INTO ls_key INDEX <lv_idx>.
+    IF sy-subrc <> 0.
+      lv_count_err += 1.
+      CONTINUE.
+    ENDIF.
+
+    "Skip if already closed
+    IF ls_key-elikz = 'X'.
+      lv_count_sk += 1.
+      CONTINUE.
+    ENDIF.
+
+    "Update EKPO (set ELIKZ if currently blank)
+    UPDATE ekpo
+      SET elikz = 'X'
+      WHERE ebeln = @ls_key-ebeln
+        AND ebelp = @ls_key-ebelp
+        AND elikz = @space.
+
+    IF sy-subrc = 0.
+      ls_key-elikz = 'X'.
+      MODIFY gt_alv FROM ls_key INDEX <lv_idx>.
+      lv_count_ok += 1.
+    ELSE.
+      lv_count_err += 1.
+    ENDIF.
+  ENDLOOP.
+
+  IF lv_count_ok > 0.
+    COMMIT WORK AND WAIT.
+  ENDIF.
+
+  PERFORM refresh_alv.
+
+  CONCATENATE lv_count_ok 'item(s) closed,' lv_count_sk 'skipped (already closed),'
+              lv_count_err 'error(s).' INTO gv_msg SEPARATED BY space.
+  MESSAGE s398(00) WITH gv_msg.
+ENDFORM.

@@ -5,7 +5,7 @@ from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 # from app.generator1 import process_payload_and_generate_abap
 from app.generator1 import generate_full_abap_program
-from app.docx_writer1 import create_abap_code_docx
+# from app.docx_writer1 import create_abap_code_docx
 
 app = FastAPI(title="ABAP Code Generator")
 
@@ -26,13 +26,15 @@ def generate_abap_doc_background(payload: dict, job_id: str):
         abap_results = generate_full_abap_program(payload)
 
         # Save ABAP code into DOCX
-        output_filename = f"ABAP_Code_{job_id}.docx"
+        output_filename = f"ABAP_Code_{job_id}.txt"
         output_path = os.path.abspath(output_filename)
-        abap_code_doc = io.BytesIO()
-        create_abap_code_docx(abap_results, abap_code_doc)
+        # abap_code_doc = io.BytesIO()
+        # create_abap_code_docx(abap_results, abap_code_doc)
 
-        with open(output_path, "wb") as f:
-            f.write(abap_code_doc.getvalue())
+        # with open(output_path, "wb") as f:
+        #     f.write(abap_code_doc.getvalue())
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(abap_results)
 
         JOBS[job_id]["status"] = "done"
         JOBS[job_id]["file_path"] = output_path
@@ -76,5 +78,6 @@ async def get_abap_doc(job_id: str):
         return FileResponse(
             job["file_path"],
             filename=os.path.basename(job["file_path"]),
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            # media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            media_type="text/plain"
         )

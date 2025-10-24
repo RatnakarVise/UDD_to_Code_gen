@@ -1,0 +1,191 @@
+SECTION 1 - ABAP REPORT PROGRAM
+REPORT z_mm_mat_vendor_alv NO STANDARD PAGE HEADING.
+
+TABLES: mara, marc, lfa1.
+
+" Title for selection block
+CONSTANTS gc_title TYPE char40 VALUE 'Selection Criteria'.
+
+" Output structure
+TYPES: BEGIN OF ty_output,
+         matnr       TYPE mara-matnr,    " Material
+         maktx       TYPE makt-maktx,    " Material description
+         mtart       TYPE mara-mtart,    " Material type
+         werks       TYPE marc-werks,    " Plant
+         werks_name  TYPE t001w-name1,   " Plant name
+         lifnr       TYPE lfa1-lifnr,    " Vendor
+         lifnr_name  TYPE lfa1-name1,    " Vendor name
+         fixkz       TYPE eord-fixkz,    " Fixed vendor indicator
+         cnt         TYPE i,             " Row counter (for totals)
+       END OF ty_output.
+
+" Selection screen
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE gc_title.
+SELECT-OPTIONS:
+  s_matnr FOR mara-matnr,
+  s_werks FOR marc-werks OBLIGATORY,
+  s_lifnr FOR lfa1-lifnr,
+  s_mtart FOR mara-mtart.
+PARAMETERS:
+  p_layo  TYPE salv_de_layout.
+SELECTION-SCREEN END OF BLOCK b1.
+
+" Work data
+DATA: lt_out TYPE STANDARD TABLE OF ty_output WITH DEFAULT KEY.
+
+" SALV references
+DATA: lo_salv      TYPE REF TO cl_salv_table,
+      lo_cols      TYPE REF TO cl_salv_columns_table,
+      lo_col       TYPE REF TO cl_salv_column_table,
+      lo_layout    TYPE REF TO cl_salv_layout,
+      lo_functions TYPE REF TO cl_salv_functions_list,
+      lo_sorts     TYPE REF TO cl_salv_sorts,
+      lo_aggr      TYPE REF TO cl_salv_aggregations.
+
+" Main flow
+START-OF-SELECTION.
+  PERFORM get_data.
+  IF lt_out IS INITIAL.
+    MESSAGE s398(00) WITH 'No data found for selection.'.
+  ELSE.
+    PERFORM display_alv.
+  ENDIF.
+
+" Fetch data based on selection
+FORM get_data.
+  CLEAR lt_out.
+
+  SELECT mara~matnr,
+         makt~maktx,
+         mara~mtart,
+         marc~werks,
+         t001w~name1 AS werks_name,
+         eord~lifnr,
+         lfa1~name1  AS lifnr_name,
+         eord~fixkz
+    FROM mara
+    INNER JOIN marc
+      ON marc~matnr = mara~matnr
+    LEFT OUTER JOIN eord
+      ON eord~matnr = marc~matnr
+     AND eord~werks = marc~werks
+    LEFT OUTER JOIN lfa1
+      ON lfa1~lifnr = eord~lifnr
+    LEFT OUTER JOIN t001w
+      ON t001w~werks = marc~werks
+    LEFT OUTER JOIN makt
+      ON makt~matnr = mara~matnr
+     AND makt~spras = @sy-langu
+    INTO CORRESPONDING FIELDS OF TABLE @lt_out
+    WHERE mara~matnr IN @s_matnr
+      AND marc~werks IN @s_werks
+      AND mara~mtart IN @s_mtart.
+
+  IF lt_out IS NOT INITIAL.
+    " Apply vendor filter if provided (keep LEFT JOIN semantics otherwise)
+    IF s_lifnr[] IS NOT INITIAL.
+      DELETE lt_out WHERE lifnr IS INITIAL OR lifnr NOT IN s_lifnr.
+    ENDIF.
+
+    " Enrich records: set counter for totals
+    LOOP AT lt_out ASSIGNING FIELD-SYMBOL(<ls_out>).
+      <ls_out>-cnt = 1.
+    ENDLOOP.
+  ENDIF.
+ENDFORM.
+
+" Display data in SALV
+FORM display_alv.
+  TRY.
+      cl_salv_table=>factory(
+        IMPORTING
+          r_salv_table = lo_salv
+        CHANGING
+          t_table      = lt_out ).
+
+      " Enable standard functions (sort, filter, export, etc.)
+      lo_functions = lo_salv->get_functions( ).
+      lo_functions->set_all( abap_true ).
+
+      " Optimize columns and set headers
+      lo_cols = lo_salv->get_columns( ).
+      lo_cols->set_optimize( abap_true ).
+
+      lo_col = lo_cols->get_column( columnname = 'MATNR' ).
+      lo_col->set_short_text(  'Material' ).
+      lo_col->set_medium_text( 'Material' ).
+      lo_col->set_long_text(   'Material Number' ).
+
+      lo_col = lo_cols->get_column( columnname = 'MAKTX' ).
+      lo_col->set_short_text(  'Descr.' ).
+      lo_col->set_medium_text( 'Description' ).
+      lo_col->set_long_text(   'Material Description' ).
+
+      lo_col = lo_cols->get_column( columnname = 'MTART' ).
+      lo_col->set_short_text(  'Type' ).
+      lo_col->set_medium_text( 'Mat. Type' ).
+      lo_col->set_long_text(   'Material Type' ).
+
+      lo_col = lo_cols->get_column( columnname = 'WERKS' ).
+      lo_col->set_short_text(  'Plant' ).
+      lo_col->set_medium_text( 'Plant' ).
+      lo_col->set_long_text(   'Plant' ).
+
+      lo_col = lo_cols->get_column( columnname = 'WERKS_NAME' ).
+      lo_col->set_short_text(  'Plant Name' ).
+      lo_col->set_medium_text( 'Plant Name' ).
+      lo_col->set_long_text(   'Plant Name' ).
+
+      lo_col = lo_cols->get_column( columnname = 'LIFNR' ).
+      lo_col->set_short_text(  'Vendor' ).
+      lo_col->set_medium_text( 'Vendor' ).
+      lo_col->set_long_text(   'Vendor' ).
+
+      lo_col = lo_cols->get_column( columnname = 'LIFNR_NAME' ).
+      lo_col->set_short_text(  'Vendor Name' ).
+      lo_col->set_medium_text( 'Vendor Name' ).
+      lo_col->set_long_text(   'Vendor Name' ).
+
+      lo_col = lo_cols->get_column( columnname = 'FIXKZ' ).
+      lo_col->set_short_text(  'Fixed' ).
+      lo_col->set_medium_text( 'Fixed Vend.' ).
+      lo_col->set_long_text(   'Fixed Vendor Indicator' ).
+
+      lo_col = lo_cols->get_column( columnname = 'CNT' ).
+      lo_col->set_short_text(  'Cnt' ).
+      lo_col->set_medium_text( 'Count' ).
+      lo_col->set_long_text(   'Row Count for Subtotals' ).
+
+      " Sorting and subtotals
+      lo_sorts = lo_salv->get_sorts( ).
+      lo_sorts->clear( ).
+      lo_sorts->add_sort( columnname = 'WERKS' subtotal = abap_true ).
+      lo_sorts->add_sort( columnname = 'MATNR' ).
+      lo_sorts->add_sort( columnname = 'LIFNR' ).
+
+      " Aggregation (totals on CNT)
+      lo_aggr = lo_salv->get_aggregations( ).
+      lo_aggr->clear( ).
+      lo_aggr->add_aggregation(
+        columnname  = 'CNT'
+        aggregation = if_salv_c_aggregation=>sum ).
+
+      " Layout handling
+      lo_layout = lo_salv->get_layout( ).
+      DATA(ls_key) = VALUE salv_s_layout_key( report = sy-repid handle = '0001' ).
+      lo_layout->set_key( ls_key ).
+      lo_layout->set_save_restriction( if_salv_c_layout=>restrict_none ).
+      IF p_layo IS NOT INITIAL.
+        lo_layout->set_initial_layout( p_layo ).
+      ENDIF.
+
+      " Display ALV
+      lo_salv->display( ).
+
+    CATCH cx_salv_msg INTO DATA(lx_msg).
+      MESSAGE lx_msg TYPE 'E'.
+  ENDTRY.
+ENDFORM.
+
+SECTION 2 - CUSTOM OBJECT DEFINITIONS
+None.

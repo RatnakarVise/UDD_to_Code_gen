@@ -1,0 +1,264 @@
+SECTION 1 - ABAP REPORT PROGRAM
+REPORT zmm_mat_ven_src_alv.
+
+*-----------------------------------------------------------------------
+* Types
+*-----------------------------------------------------------------------
+TYPES: BEGIN OF ty_out,
+         matnr      TYPE mara-matnr,
+         maktx      TYPE makt-maktx,
+         mtart      TYPE mara-mtart,
+         mtbez      TYPE t134t-mtbez,
+         matkl      TYPE mara-matkl,
+         meins      TYPE mara-meins,
+         werks      TYPE eord-werks,
+         werks_name TYPE t001w-name1,
+         lifnr      TYPE lfa1-lifnr,
+         name1      TYPE lfa1-name1,
+         kzflg      TYPE eord-kzflg,  " Fixed source
+         elikz      TYPE eord-elikz,  " Deletion indicator
+         vdatu      TYPE eord-vdatu,  " Valid from
+         bdatu      TYPE eord-bdatu,  " Valid to
+         numrec     TYPE i,           " For subtotals/count
+       END OF ty_out.
+
+*-----------------------------------------------------------------------
+* Data declarations
+*-----------------------------------------------------------------------
+DATA: gt_out     TYPE STANDARD TABLE OF ty_out WITH DEFAULT KEY,
+      gs_out     TYPE ty_out.
+
+* ALV objects and structures
+DATA: go_dock    TYPE REF TO cl_gui_docking_container,
+      go_alv     TYPE REF TO cl_gui_alv_grid.
+
+DATA: gt_fcat    TYPE lvc_t_fcat,
+      gs_fcat    TYPE lvc_s_fcat,
+      gs_layout  TYPE lvc_s_layo,
+      gt_sort    TYPE lvc_t_sort,
+      gs_sort    TYPE lvc_s_sort,
+      gs_variant TYPE disvariant.
+
+DATA: gv_repid   TYPE syrepid VALUE sy-repid.
+
+*-----------------------------------------------------------------------
+* Selection screen
+*-----------------------------------------------------------------------
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-001.
+SELECT-OPTIONS: s_matnr FOR mara-matnr,
+                s_werks FOR t001w-werks OBLIGATORY,
+                s_lifnr FOR lfa1-lifnr,
+                s_mtart FOR mara-mtart.
+SELECTION-SCREEN END OF BLOCK b1.
+
+SELECTION-SCREEN COMMENT /1(70) text-002.
+
+INITIALIZATION.
+  text-001 = 'Selection Criteria'.
+  text-002 = 'Material-Vendor Source List ALV (Sorting/Filtering/Subtotals/Export/Layout)'.
+
+*-----------------------------------------------------------------------
+* Events
+*-----------------------------------------------------------------------
+AT SELECTION-SCREEN.
+  " OBLIGATORY on S_WERKS enforces input; no extra checks needed.
+
+START-OF-SELECTION.
+  PERFORM get_data.
+  IF gt_out IS INITIAL.
+    MESSAGE 'No data found for given selection.' TYPE 'S'.
+    RETURN.
+  ENDIF.
+
+  PERFORM build_fieldcatalog.
+  PERFORM display_alv.
+
+END-OF-SELECTION.
+  " No post-processing
+
+*-----------------------------------------------------------------------
+* Form routines
+*-----------------------------------------------------------------------
+FORM get_data.
+  " Retrieve source list data with material/vendor/plant texts
+  FIELD-SYMBOLS: <ls_out> TYPE ty_out.
+
+  SELECT
+    e~matnr,
+    m~mtart,
+    e~werks,
+    e~lifnr,
+    e~vdatu,
+    e~bdatu,
+    e~kzflg,
+    e~elikz,
+    m~matkl,
+    m~meins,
+    t~mtbez,
+    w~name1 AS werks_name,
+    k~maktx,
+    l~name1
+    FROM eord AS e
+    INNER JOIN mara AS m
+      ON m~matnr = e~matnr
+    LEFT OUTER JOIN makt AS k
+      ON k~matnr = m~matnr
+     AND k~spras = @sy-langu
+    LEFT OUTER JOIN lfa1 AS l
+      ON l~lifnr = e~lifnr
+    LEFT OUTER JOIN t001w AS w
+      ON w~werks = e~werks
+    LEFT OUTER JOIN t134t AS t
+      ON t~mtart = m~mtart
+     AND t~spras = @sy-langu
+    WHERE e~matnr IN @s_matnr
+      AND e~werks IN @s_werks
+      AND e~lifnr IN @s_lifnr
+      AND m~mtart IN @s_mtart
+    INTO CORRESPONDING FIELDS OF TABLE @gt_out.
+
+  " Set count field for ALV subtotals
+  LOOP AT gt_out ASSIGNING <ls_out>.
+    <ls_out>-numrec = 1.
+  ENDLOOP.
+
+ENDFORM.
+
+FORM build_fieldcatalog.
+  " Build ALV field catalog, layout, and sorting
+  CLEAR gt_fcat.
+
+  PERFORM add_fcat USING 'MATNR'      'Material'         'MARA'  'MATNR' '' 'X' '' '' '' ''.
+  PERFORM add_fcat USING 'MAKTX'      'Material Desc.'   'MAKT'  'MAKTX' '' ''  '' 'X' '' ''.
+  PERFORM add_fcat USING 'MTART'      'Mat. Type'        'MARA'  'MTART' '' ''  '' '' '' ''.
+  PERFORM add_fcat USING 'MTBEZ'      'Mat. Type Text'   'T134T' 'MTBEZ' '' ''  '' 'X' '' ''.
+  PERFORM add_fcat USING 'MATKL'      'Mat. Group'       'MARA'  'MATKL' '' ''  '' '' '' ''.
+  PERFORM add_fcat USING 'MEINS'      'Base UoM'         'MARA'  'MEINS' '' ''  '' '' '' ''.
+
+  PERFORM add_fcat USING 'WERKS'      'Plant'            'EORD'  'WERKS' '' 'X' '' '' '' ''.
+  PERFORM add_fcat USING 'WERKS_NAME' 'Plant Name'       'T001W' 'NAME1' '' ''  '' 'X' '' ''.
+
+  PERFORM add_fcat USING 'LIFNR'      'Vendor'           'LFA1'  'LIFNR' '' 'X' '' '' '' ''.
+  PERFORM add_fcat USING 'NAME1'      'Vendor Name'      'LFA1'  'NAME1' '' ''  '' 'X' '' ''.
+
+  PERFORM add_fcat USING 'KZFLG'      'Fixed Src'        'EORD'  'KZFLG' '' ''  '' '' '' ''.
+  PERFORM add_fcat USING 'ELIKZ'      'Deleted'          'EORD'  'ELIKZ' '' ''  '' '' '' ''.
+  PERFORM add_fcat USING 'VDATU'      'Valid From'       'EORD'  'VDATU' '' ''  '' '' '' ''.
+  PERFORM add_fcat USING 'BDATU'      'Valid To'         'EORD'  'BDATU' '' ''  '' '' '' ''.
+
+  PERFORM add_fcat USING 'NUMREC'     'Records'          ''      ''      'X' ''  '' '' 'X' ''.
+
+  CLEAR gs_layout.
+  gs_layout-zebra      = abap_true.
+  gs_layout-cwidth_opt = abap_true.
+  gs_layout-sel_mode   = 'A'.
+
+  CLEAR gt_sort.
+
+  CLEAR gs_sort.
+  gs_sort-spos      = 1.
+  gs_sort-fieldname = 'WERKS'.
+  gs_sort-up        = abap_true.
+  gs_sort-subtot    = abap_true.
+  APPEND gs_sort TO gt_sort.
+
+  CLEAR gs_sort.
+  gs_sort-spos      = 2.
+  gs_sort-fieldname = 'LIFNR'.
+  gs_sort-up        = abap_true.
+  gs_sort-subtot    = abap_true.
+  APPEND gs_sort TO gt_sort.
+
+  gs_variant-report = gv_repid.
+
+ENDFORM.
+
+FORM add_fcat USING    p_field    TYPE lvc_fname
+                        p_coltext  TYPE scrtext_s
+                        p_ref_tab  TYPE tabname
+                        p_ref_fld  TYPE fieldname
+                        p_sum      TYPE c
+                        p_key      TYPE c
+                        p_hot      TYPE c
+                        p_long     TYPE c
+                        p_do_sum   TYPE c
+                        p_no_out   TYPE c.
+  " Helper to add field catalog entry with common options
+  CLEAR gs_fcat.
+  gs_fcat-fieldname = p_field.
+  gs_fcat-coltext   = p_coltext.
+
+  IF p_ref_tab IS NOT INITIAL AND p_ref_fld IS NOT INITIAL.
+    gs_fcat-ref_table = p_ref_tab.
+    gs_fcat-ref_field = p_ref_fld.
+  ENDIF.
+
+  IF p_sum = 'X'.
+    gs_fcat-just = 'R'.
+  ENDIF.
+
+  IF p_key = 'X'.
+    gs_fcat-key = abap_true.
+  ENDIF.
+
+  IF p_hot = 'X'.
+    gs_fcat-hotspot = abap_true.
+  ENDIF.
+
+  IF p_long = 'X'.
+    gs_fcat-outputlen = 30.
+  ENDIF.
+
+  IF p_do_sum = 'X'.
+    gs_fcat-do_sum = abap_true.
+  ENDIF.
+
+  IF p_no_out = 'X'.
+    gs_fcat-no_out = abap_true.
+  ENDIF.
+
+  APPEND gs_fcat TO gt_fcat.
+ENDFORM.
+
+FORM display_alv.
+  " Display output using docking container and ALV grid
+  DATA: ls_grid_set TYPE lvc_s_glay.
+
+  IF go_dock IS INITIAL.
+    CREATE OBJECT go_dock
+      EXPORTING
+        repid     = sy-repid
+        dynnr     = sy-dynnr
+        side      = cl_gui_docking_container=>dock_at_left
+        extension = 9999.
+
+    CREATE OBJECT go_alv
+      EXPORTING
+        i_parent = go_dock.
+  ENDIF.
+
+  ls_grid_set-edt_cll_cb = abap_false.
+
+  CALL METHOD go_alv->set_table_for_first_display
+    EXPORTING
+      is_layout        = gs_layout
+      is_variant       = gs_variant
+      i_save           = 'A'          " Allow layout saving
+      i_default        = abap_true
+      is_grid_settings = ls_grid_set
+    CHANGING
+      it_fieldcatalog  = gt_fcat
+      it_sort          = gt_sort
+      it_outtab        = gt_out.
+
+  " Optimize column widths again (some releases need explicit call)
+  CALL METHOD go_alv->optimize_all_cols.
+
+  " Flush to frontend
+  cl_gui_cfw=>flush( ).
+
+ENDFORM.
+
+
+SECTION 2 - CUSTOM OBJECT DEFINITIONS
+None.

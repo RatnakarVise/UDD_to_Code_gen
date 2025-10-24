@@ -1,0 +1,645 @@
+REPORT zmm_po_close.
+
+************************************************************************
+* Utility to close open POs - ZMM_PO_CLOSE
+* Type: Executable
+* Output: ALV Grid (sorting, filtering, subtotalling, exporting, layout)
+* Presentation: SAP GUI and Fiori (GUI for HTML)
+************************************************************************
+
+TYPE-POOLS: abap.
+TYPE-POOLS: icon.
+
+************************************************************************
+* Types
+************************************************************************
+TYPES: BEGIN OF ty_raw,
+         ebeln TYPE ekko-ebeln,
+         ebelp TYPE ekpo-ebelp,
+         matnr TYPE ekpo-matnr,
+         werks TYPE ekpo-werks,
+         elikz TYPE ekpo-elikz,
+         menge TYPE ekpo-menge,
+         meins TYPE ekpo-meins,
+         lifnr TYPE ekko-lifnr,
+         bedat TYPE ekko-bedat,
+         mtart TYPE mara-mtart,
+       END OF ty_raw.
+
+TYPES: BEGIN OF ty_eket,
+         ebeln TYPE eket-ebeln,
+         ebelp TYPE eket-ebelp,
+         eindt TYPE eket-eindt,
+       END OF ty_eket.
+
+TYPES: BEGIN OF ty_out,
+         sel     TYPE char1,              " Checkbox for selection
+         ebeln   TYPE ekko-ebeln,
+         ebelp   TYPE ekpo-ebelp,
+         elikz   TYPE ekpo-elikz,
+         matnr   TYPE ekpo-matnr,
+         mtart   TYPE mara-mtart,
+         werks   TYPE ekpo-werks,
+         lifnr   TYPE ekko-lifnr,
+         name1   TYPE lfa1-name1,
+         menge   TYPE ekpo-menge,
+         meins   TYPE ekpo-meins,
+         bedat   TYPE ekko-bedat,        " From EKKO
+         z_bedat TYPE zta_mm_po-bedat,   " From ZTA_MM_PO
+         eindt   TYPE eket-eindt,        " Earliest schedule date
+       END OF ty_out.
+
+TYPES: tt_out  TYPE STANDARD TABLE OF ty_out WITH DEFAULT KEY.
+TYPES: tt_raw  TYPE STANDARD TABLE OF ty_raw WITH DEFAULT KEY.
+TYPES: tt_eket TYPE SORTED TABLE OF ty_eket WITH UNIQUE KEY ebeln ebelp.
+
+TYPES: BEGIN OF ty_ztapo,
+         matnr TYPE zta_mm_po-matnr,
+         ebeln TYPE zta_mm_po-ebeln,
+         ebelp TYPE zta_mm_po-ebelp,
+         bedat TYPE zta_mm_po-bedat,
+       END OF ty_ztapo.
+TYPES: tt_ztapo TYPE SORTED TABLE OF ty_ztapo WITH UNIQUE KEY ebeln ebelp matnr.
+
+************************************************************************
+* Data
+************************************************************************
+DATA: gt_out      TYPE tt_out,
+      gt_raw      TYPE tt_raw,
+      gt_eket     TYPE tt_eket,
+      gt_ztapo    TYPE tt_ztapo.
+
+" Vendor master cache
+DATA: gt_lfa1     TYPE SORTED TABLE OF lfa1 WITH UNIQUE KEY lifnr.
+
+" ALV objects and data
+DATA: go_dock     TYPE REF TO cl_gui_docking_container,
+      go_grid     TYPE REF TO cl_gui_alv_grid.
+
+DATA: gt_fcat     TYPE lvc_t_fcat,
+      gs_layout   TYPE lvc_s_layo,
+      gs_variant  TYPE disvariant,
+      gv_save     TYPE c VALUE 'A'.
+
+" For messages
+DATA: gt_messages TYPE STANDARD TABLE OF bapiret2,
+      gs_message  TYPE bapiret2.
+
+************************************************************************
+* Selection Screen
+************************************************************************
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-001.
+SELECT-OPTIONS: s_matnr FOR mara-matnr.
+SELECT-OPTIONS: s_werks FOR ekpo-werks OBLIGATORY.
+SELECT-OPTIONS: s_lifnr FOR ekko-lifnr.
+SELECT-OPTIONS: s_mtart FOR mara-mtart.
+SELECTION-SCREEN END OF BLOCK b1.
+
+************************************************************************
+* Local Event Handler Class for ALV
+************************************************************************
+CLASS lcl_event_handler DEFINITION.
+  PUBLIC SECTION.
+    METHODS:
+      on_toolbar
+        FOR EVENT toolbar OF cl_gui_alv_grid
+        IMPORTING e_object e_interactive,
+      on_user_command
+        FOR EVENT user_command OF cl_gui_alv_grid
+        IMPORTING e_ucomm.
+ENDCLASS.
+
+CLASS lcl_event_handler IMPLEMENTATION.
+  METHOD on_toolbar.
+    " Add custom toolbar buttons
+    DATA: ls_btn TYPE stb_button.
+
+    CLEAR ls_btn.
+    ls_btn-function  = 'CLOSE'.
+    ls_btn-icon      = icon_okay.
+    ls_btn-quickinfo = 'Close Selected PO Items'.
+    ls_btn-text      = 'Close Selected'.
+    ls_btn-disabled  = abap_false.
+    APPEND ls_btn TO e_object->mt_toolbar.
+
+    CLEAR ls_btn.
+    ls_btn-function  = 'REFRESH'.
+    ls_btn-icon      = icon_refresh.
+    ls_btn-quickinfo = 'Refresh Data'.
+    ls_btn-text      = 'Refresh'.
+    ls_btn-disabled  = abap_false.
+    APPEND ls_btn TO e_object->mt_toolbar.
+  ENDMETHOD.
+
+  METHOD on_user_command.
+    " Handle toolbar actions
+    CASE e_ucomm.
+      WHEN 'CLOSE'.
+        PERFORM close_selected.
+      WHEN 'REFRESH'.
+        PERFORM get_data.
+        PERFORM alv_refresh.
+      WHEN OTHERS.
+        " Do nothing
+    ENDCASE.
+  ENDMETHOD.
+ENDCLASS.
+
+DATA: go_handler TYPE REF TO lcl_event_handler.
+
+************************************************************************
+* Selection Screen Validation
+************************************************************************
+AT SELECTION-SCREEN.
+  " Redundant to OBLIGATORY but keeps explicit check and friendly message
+  IF s_werks[] IS INITIAL.
+    MESSAGE e398(00) WITH 'Plant (S_WERKS) is mandatory.'.
+  ENDIF.
+
+************************************************************************
+* Start-of-selection
+************************************************************************
+START-OF-SELECTION.
+  PERFORM get_data.
+  PERFORM alv_display.
+
+************************************************************************
+* Forms
+************************************************************************
+
+FORM get_data.
+  "----------------------------------------------------------------------
+  " Collect data for ALV:
+  " - Open PO items (EKPO/EKKO/MARA)
+  " - Earliest schedule date (EKET)
+  " - Vendor name (LFA1)
+  " - Custom PO date enrichment (ZTA_MM_PO)
+  "----------------------------------------------------------------------
+
+  CLEAR: gt_out, gt_raw, gt_eket, gt_ztapo, gt_lfa1, gt_messages.
+
+  " Flags to enable conditional filtering in the SELECT
+  DATA(lv_f_lifnr) TYPE abap_bool VALUE COND abap_bool( WHEN s_lifnr[] IS INITIAL THEN abap_false ELSE abap_true ).
+  DATA(lv_f_matnr) TYPE abap_bool VALUE COND abap_bool( WHEN s_matnr[] IS INITIAL THEN abap_false ELSE abap_true ).
+  DATA(lv_f_mtart) TYPE abap_bool VALUE COND abap_bool( WHEN s_mtart[] IS INITIAL THEN abap_false ELSE abap_true ).
+
+  " 1) Fetch open PO items (not delivery-completed) with optional filters
+  SELECT ekpo~ebeln,
+         ekpo~ebelp,
+         ekpo~matnr,
+         ekpo~werks,
+         ekpo~elikz,
+         ekpo~menge,
+         ekpo~meins,
+         ekko~lifnr,
+         ekko~bedat,
+         mara~mtart
+    FROM ekpo
+    INNER JOIN ekko ON ekko~ebeln = ekpo~ebeln
+    LEFT OUTER JOIN mara ON mara~matnr = ekpo~matnr
+    INTO TABLE @gt_raw
+    WHERE ekpo~elikz = @space
+      AND ekpo~werks IN @s_werks
+      AND ( @lv_f_lifnr = @abap_false OR ekko~lifnr IN @s_lifnr )
+      AND ( @lv_f_matnr = @abap_false OR ekpo~matnr IN @s_matnr )
+      AND ( @lv_f_mtart = @abap_false OR mara~mtart IN @s_mtart ).
+
+  IF gt_raw IS INITIAL.
+    MESSAGE s398(00) WITH 'No open PO items found for the given criteria.'.
+    RETURN.
+  ENDIF.
+
+  " 2) Get earliest schedule date from EKET for the selected items
+  SELECT ebeln,
+         ebelp,
+         MIN( eindt ) AS eindt
+    FROM eket
+    INTO TABLE @gt_eket
+    FOR ALL ENTRIES IN @gt_raw
+    WHERE ebeln = @gt_raw-ebeln
+      AND ebelp = @gt_raw-ebelp
+    GROUP BY ebeln, ebelp.
+
+  " 3) Get vendor names for involved vendors
+  SELECT lifnr,
+         name1
+    FROM lfa1
+    INTO TABLE @gt_lfa1
+    FOR ALL ENTRIES IN @gt_raw
+    WHERE lifnr = @gt_raw-lifnr.
+
+  " 4) Read custom table ZTA_MM_PO for enrichment (by exact keys)
+  SELECT matnr,
+         ebeln,
+         ebelp,
+         bedat
+    FROM zta_mm_po
+    INTO TABLE @gt_ztapo
+    FOR ALL ENTRIES IN @gt_raw
+    WHERE ebeln = @gt_raw-ebeln
+      AND ebelp = @gt_raw-ebelp
+      AND matnr = @gt_raw-matnr.
+
+  " 5) Build output rows
+  DATA(ls_out) = VALUE ty_out( ).
+  LOOP AT gt_raw ASSIGNING FIELD-SYMBOL(<ls_raw>).
+
+    CLEAR ls_out.
+    ls_out-sel   = space.
+    ls_out-ebeln = <ls_raw>-ebeln.
+    ls_out-ebelp = <ls_raw>-ebelp.
+    ls_out-elikz = <ls_raw>-elikz.
+    ls_out-matnr = <ls_raw>-matnr.
+    ls_out-mtart = <ls_raw>-mtart.
+    ls_out-werks = <ls_raw>-werks.
+    ls_out-lifnr = <ls_raw>-lifnr.
+    ls_out-menge = <ls_raw>-menge.
+    ls_out-meins = <ls_raw>-meins.
+    ls_out-bedat = <ls_raw>-bedat.
+
+    " Vendor name
+    READ TABLE gt_lfa1 INTO DATA(ls_lfa1) WITH KEY lifnr = <ls_raw>-lifnr.
+    IF sy-subrc = 0.
+      ls_out-name1 = ls_lfa1-name1.
+    ENDIF.
+
+    " Earliest schedule date
+    READ TABLE gt_eket INTO DATA(ls_eket) WITH KEY ebeln = <ls_raw>-ebeln ebelp = <ls_raw>-ebelp.
+    IF sy-subrc = 0.
+      ls_out-eindt = ls_eket-eindt.
+    ENDIF.
+
+    " ZTA_MM_PO PO date enrichment
+    READ TABLE gt_ztapo INTO DATA(ls_ztapo) WITH KEY ebeln = <ls_raw>-ebeln ebelp = <ls_raw>-ebelp matnr = <ls_raw>-matnr.
+    IF sy-subrc = 0.
+      ls_out-z_bedat = ls_ztapo-bedat.
+    ENDIF.
+
+    APPEND ls_out TO gt_out.
+  ENDLOOP.
+
+ENDFORM.
+
+FORM alv_display.
+  "----------------------------------------------------------------------
+  " Create and show ALV Grid (first time) or refresh if it already exists
+  "----------------------------------------------------------------------
+
+  IF go_dock IS INITIAL.
+    CREATE OBJECT go_dock
+      EXPORTING
+        side      = cl_gui_docking_container=>dock_at_left
+        extension = 10000
+      EXCEPTIONS
+        OTHERS    = 1.
+  ENDIF.
+
+  IF go_grid IS INITIAL.
+    CREATE OBJECT go_grid
+      EXPORTING
+        i_parent = go_dock.
+
+    " Register event handlers
+    CREATE OBJECT go_handler.
+    SET HANDLER go_handler->on_toolbar      FOR go_grid.
+    SET HANDLER go_handler->on_user_command FOR go_grid.
+
+    " Prepare ALV
+    PERFORM build_fcat.
+    PERFORM build_layout.
+
+    gs_variant-report = sy-repid.
+
+    CALL METHOD go_grid->set_table_for_first_display
+      EXPORTING
+        is_layout       = gs_layout
+        is_variant      = gs_variant
+        i_save          = gv_save
+      CHANGING
+        it_outtab       = gt_out
+        it_fieldcatalog = gt_fcat.
+  ELSE.
+    PERFORM alv_refresh.
+  ENDIF.
+ENDFORM.
+
+FORM alv_refresh.
+  "----------------------------------------------------------------------
+  " Refresh ALV with stable row/column positions
+  "----------------------------------------------------------------------
+  IF go_grid IS BOUND.
+    CALL METHOD go_grid->refresh_table_display
+      EXPORTING
+        is_stable = VALUE lvc_s_stbl( row = 'X' col = 'X' ).
+  ENDIF.
+ENDFORM.
+
+FORM build_fcat.
+  "----------------------------------------------------------------------
+  " Build field catalog for ALV columns
+  "----------------------------------------------------------------------
+  CLEAR gt_fcat.
+
+  DATA ls_fcat TYPE lvc_s_fcat.
+
+  " Checkbox
+  CLEAR ls_fcat.
+  ls_fcat-fieldname  = 'SEL'.
+  ls_fcat-coltext    = 'Select'.
+  ls_fcat-checkbox   = 'X'.
+  ls_fcat-edit       = 'X'.
+  ls_fcat-outputlen  = 5.
+  APPEND ls_fcat TO gt_fcat.
+
+  " PO Number
+  CLEAR ls_fcat.
+  ls_fcat-fieldname  = 'EBELN'.
+  ls_fcat-ref_table  = 'EKKO'.
+  ls_fcat-ref_field  = 'EBELN'.
+  ls_fcat-key        = 'X'.
+  ls_fcat-coltext    = 'PO Number'.
+  APPEND ls_fcat TO gt_fcat.
+
+  " Item
+  CLEAR ls_fcat.
+  ls_fcat-fieldname  = 'EBELP'.
+  ls_fcat-ref_table  = 'EKPO'.
+  ls_fcat-ref_field  = 'EBELP'.
+  ls_fcat-key        = 'X'.
+  ls_fcat-coltext    = 'Item'.
+  APPEND ls_fcat TO gt_fcat.
+
+  " Delivery Completed
+  CLEAR ls_fcat.
+  ls_fcat-fieldname  = 'ELIKZ'.
+  ls_fcat-ref_table  = 'EKPO'.
+  ls_fcat-ref_field  = 'ELIKZ'.
+  ls_fcat-coltext    = 'Delivery Completed'.
+  APPEND ls_fcat TO gt_fcat.
+
+  " Material
+  CLEAR ls_fcat.
+  ls_fcat-fieldname  = 'MATNR'.
+  ls_fcat-ref_table  = 'EKPO'.
+  ls_fcat-ref_field  = 'MATNR'.
+  ls_fcat-coltext    = 'Material'.
+  APPEND ls_fcat TO gt_fcat.
+
+  " Material Type
+  CLEAR ls_fcat.
+  ls_fcat-fieldname  = 'MTART'.
+  ls_fcat-ref_table  = 'MARA'.
+  ls_fcat-ref_field  = 'MTART'.
+  ls_fcat-coltext    = 'Material Type'.
+  APPEND ls_fcat TO gt_fcat.
+
+  " Plant
+  CLEAR ls_fcat.
+  ls_fcat-fieldname  = 'WERKS'.
+  ls_fcat-ref_table  = 'EKPO'.
+  ls_fcat-ref_field  = 'WERKS'.
+  ls_fcat-coltext    = 'Plant'.
+  APPEND ls_fcat TO gt_fcat.
+
+  " Vendor
+  CLEAR ls_fcat.
+  ls_fcat-fieldname  = 'LIFNR'.
+  ls_fcat-ref_table  = 'EKKO'.
+  ls_fcat-ref_field  = 'LIFNR'.
+  ls_fcat-coltext    = 'Vendor'.
+  APPEND ls_fcat TO gt_fcat.
+
+  " Vendor Name
+  CLEAR ls_fcat.
+  ls_fcat-fieldname  = 'NAME1'.
+  ls_fcat-ref_table  = 'LFA1'.
+  ls_fcat-ref_field  = 'NAME1'.
+  ls_fcat-coltext    = 'Vendor Name'.
+  ls_fcat-outputlen  = 25.
+  APPEND ls_fcat TO gt_fcat.
+
+  " Quantity
+  CLEAR ls_fcat.
+  ls_fcat-fieldname  = 'MENGE'.
+  ls_fcat-ref_table  = 'EKPO'.
+  ls_fcat-ref_field  = 'MENGE'.
+  ls_fcat-coltext    = 'Quantity'.
+  ls_fcat-do_sum     = 'X'.
+  APPEND ls_fcat TO gt_fcat.
+
+  " UoM
+  CLEAR ls_fcat.
+  ls_fcat-fieldname  = 'MEINS'.
+  ls_fcat-ref_table  = 'EKPO'.
+  ls_fcat-ref_field  = 'MEINS'.
+  ls_fcat-coltext    = 'UoM'.
+  APPEND ls_fcat TO gt_fcat.
+
+  " PO Date (EKKO)
+  CLEAR ls_fcat.
+  ls_fcat-fieldname  = 'BEDAT'.
+  ls_fcat-ref_table  = 'EKKO'.
+  ls_fcat-ref_field  = 'BEDAT'.
+  ls_fcat-coltext    = 'PO Date (EKKO)'.
+  APPEND ls_fcat TO gt_fcat.
+
+  " PO Date (ZTA_MM_PO)
+  CLEAR ls_fcat.
+  ls_fcat-fieldname  = 'Z_BEDAT'.
+  ls_fcat-coltext    = 'PO Date (ZTA_MM_PO)'.
+  ls_fcat-outputlen  = 10.
+  APPEND ls_fcat TO gt_fcat.
+
+  " Earliest Schedule Date
+  CLEAR ls_fcat.
+  ls_fcat-fieldname  = 'EINDT'.
+  ls_fcat-ref_table  = 'EKET'.
+  ls_fcat-ref_field  = 'EINDT'.
+  ls_fcat-coltext    = 'Earliest Schedule Date'.
+  APPEND ls_fcat TO gt_fcat.
+
+ENDFORM.
+
+FORM build_layout.
+  "----------------------------------------------------------------------
+  " Define ALV layout (zebra, optimal column width, multi-select)
+  "----------------------------------------------------------------------
+  CLEAR gs_layout.
+  gs_layout-zebra         = 'X'.
+  gs_layout-cwidth_opt    = 'X'.
+  gs_layout-box_fieldname = 'SEL'.
+  gs_layout-sel_mode      = 'A'.  " Multiple selection
+ENDFORM.
+
+FORM get_selected_rows CHANGING ct_idx TYPE lvc_t_row ct_sel TYPE tt_out.
+  "----------------------------------------------------------------------
+  " Collect selected ALV rows:
+  " - Prefer ALV row selection
+  " - Fallback to checkbox column SEL
+  "----------------------------------------------------------------------
+  CLEAR: ct_idx, ct_sel.
+
+  IF go_grid IS BOUND.
+    CALL METHOD go_grid->get_selected_rows
+      IMPORTING
+        et_index_rows = ct_idx
+      EXCEPTIONS
+        OTHERS        = 1.
+  ENDIF.
+
+  " Also consider checkbox column SEL in case no row selection
+  IF ct_idx IS INITIAL.
+    DATA(lv_idx) TYPE sy-tabix.
+    LOOP AT gt_out ASSIGNING FIELD-SYMBOL(<ls_out_row>).
+      lv_idx = sy-tabix.
+      IF <ls_out_row>-sel = 'X'.
+        APPEND VALUE lvc_s_row( index = lv_idx ) TO ct_idx.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+  " Build selected rows table
+  LOOP AT ct_idx ASSIGNING FIELD-SYMBOL(<ls_idx>).
+    READ TABLE gt_out ASSIGNING FIELD-SYMBOL(<ls_sel>) INDEX <ls_idx>-index.
+    IF sy-subrc = 0.
+      APPEND <ls_sel> TO ct_sel.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.
+
+FORM close_selected.
+  "----------------------------------------------------------------------
+  " Close selected PO items by setting Delivery Completed (EKPO-ELIKZ)
+  " via BAPI_PO_CHANGE (NO_MORE_GR = 'X'), grouped per PO number.
+  "----------------------------------------------------------------------
+
+  DATA: lt_idx  TYPE lvc_t_row,
+        lt_sel  TYPE tt_out.
+
+  PERFORM get_selected_rows CHANGING lt_idx lt_sel.
+
+  IF lt_sel IS INITIAL.
+    MESSAGE s398(00) WITH 'No rows selected. Use row select or checkbox.'.
+    RETURN.
+  ENDIF.
+
+  " Group items by PO and call BAPI for each PO
+  SORT lt_sel BY ebeln ebelp.
+
+  DATA: lv_curr_ebeln TYPE ekko-ebeln,
+        lt_items      TYPE STANDARD TABLE OF bapimepoitem,
+        lt_itemsx     TYPE STANDARD TABLE OF bapimepoitemx,
+        lt_return     TYPE STANDARD TABLE OF bapiret2,
+        ls_item       TYPE bapimepoitem,
+        ls_itemx      TYPE bapimepoitemx,
+        lv_trigger    TYPE abap_bool.
+
+  FIELD-SYMBOLS: <ls_sel> TYPE ty_out.
+
+  CLEAR: lv_curr_ebeln, lt_items, lt_itemsx, lt_return, lv_trigger.
+
+  LOOP AT lt_sel ASSIGNING <ls_sel>.
+    " Skip items already closed
+    IF <ls_sel>-elikz = 'X'.
+      CONTINUE.
+    ENDIF.
+
+    " Initialize current PO or detect PO change
+    IF lv_curr_ebeln IS INITIAL.
+      lv_curr_ebeln = <ls_sel>-ebeln.
+    ELSEIF <ls_sel>-ebeln NE lv_curr_ebeln.
+      lv_trigger = abap_true.
+    ENDIF.
+
+    " If PO changed, process previous group
+    IF lv_trigger = abap_true.
+      IF lt_items IS NOT INITIAL.
+        CALL FUNCTION 'BAPI_PO_CHANGE'
+          EXPORTING
+            purchaseorder = lv_curr_ebeln
+          TABLES
+            return        = lt_return
+            poitem        = lt_items
+            poitemx       = lt_itemsx.
+
+        APPEND LINES OF lt_return TO gt_messages.
+
+        " Commit if no hard errors
+        IF line_exists( lt_return[ type = 'A' ] ) OR line_exists( lt_return[ type = 'E' ] ).
+          ROLLBACK WORK.
+        ELSE.
+          CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+            EXPORTING
+              wait = abap_true.
+          " Reflect in ALV output for successfully updated items
+          LOOP AT lt_items INTO ls_item.
+            LOOP AT gt_out ASSIGNING FIELD-SYMBOL(<ls_out>) WHERE ebeln = lv_curr_ebeln AND ebelp = ls_item-po_item.
+              <ls_out>-elikz = 'X'.
+              <ls_out>-sel   = space.
+            ENDLOOP.
+          ENDLOOP.
+        ENDIF.
+      ENDIF.
+
+      " Reset for new PO group
+      CLEAR: lt_items, lt_itemsx, lt_return.
+      lv_curr_ebeln = <ls_sel>-ebeln.
+      lv_trigger    = abap_false.
+    ENDIF.
+
+    " Build BAPI items for current line
+    CLEAR: ls_item, ls_itemx.
+    ls_item-po_item     = <ls_sel>-ebelp.
+    ls_item-no_more_gr  = 'X'.         " Set Delivery Completed
+    APPEND ls_item TO lt_items.
+
+    ls_itemx-po_item    = <ls_sel>-ebelp.
+    ls_itemx-no_more_gr = 'X'.
+    ls_itemx-updateflag = 'U'.
+    APPEND ls_itemx TO lt_itemsx.
+  ENDLOOP.
+
+  " Process the last PO group
+  IF lt_items IS NOT INITIAL AND lv_curr_ebeln IS NOT INITIAL.
+    CLEAR lt_return.
+    CALL FUNCTION 'BAPI_PO_CHANGE'
+      EXPORTING
+        purchaseorder = lv_curr_ebeln
+      TABLES
+        return        = lt_return
+        poitem        = lt_items
+        poitemx       = lt_itemsx.
+
+    APPEND LINES OF lt_return TO gt_messages.
+
+    IF line_exists( lt_return[ type = 'A' ] ) OR line_exists( lt_return[ type = 'E' ] ).
+      ROLLBACK WORK.
+    ELSE.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = abap_true.
+      LOOP AT lt_items INTO ls_item.
+        LOOP AT gt_out ASSIGNING FIELD-SYMBOL(<ls_out2>) WHERE ebeln = lv_curr_ebeln AND ebelp = ls_item-po_item.
+          <ls_out2>-elikz = 'X'.
+          <ls_out2>-sel   = space.
+        ENDLOOP.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+
+  " Refresh ALV
+  PERFORM alv_refresh.
+
+  " Show summary message
+  DATA(lv_err_cnt) TYPE i VALUE 0.
+  LOOP AT gt_messages INTO gs_message WHERE type = 'A' OR type = 'E'.
+    lv_err_cnt = lv_err_cnt + 1.
+  ENDLOOP.
+
+  IF lv_err_cnt > 0.
+    MESSAGE s398(00) WITH |Completed with { lv_err_cnt } error(s). Check application log.| .
+  ELSE.
+    MESSAGE s398(00) WITH 'Selected items were closed successfully (if eligible).'.
+  ENDIF.
+
+ENDFORM.

@@ -172,22 +172,12 @@ def validate_requirement_coverage(llm, requirements_text: str, abap_code: str) -
 
 
 # --------------------------
-# Helper: Detect custom Z* tables
-# --------------------------
-def detect_custom_z_objects(text: str) -> List[str]:
-    """Detects custom Z* tables, structures, or types in requirement or code."""
-    objects = re.findall(r"\bZ[A-Z0-9_]+\b", text)
-    # remove duplicates & short ones like Z1
-    return sorted(set([obj for obj in objects if len(obj) > 3]))
-
-
-# --------------------------
 # Main Logic: Generate Full ABAP Program
 # --------------------------
 def generate_full_abap_program(
     payload: str,
     udd_mapping: Optional[Dict[str, List[str]]] = None
-) -> str:
+) -> Dict[str, str]:
     """Generates, refines, and validates an ABAP report dynamically."""
     logger.info("🚀 Starting ABAP generation process...")
 
@@ -209,7 +199,11 @@ def generate_full_abap_program(
 
     # Initialize LLM
     logger.info("⚙️ Initializing ChatOpenAI model...")
-    llm = ChatOpenAI(model="gpt-5", temperature=0.2, api_key=openai_api_key)
+    llm = ChatOpenAI(
+        model="gpt-5",
+        temperature=0.2,
+        api_key=openai_api_key,
+    )
 
     # -----------------------
     # PASS 1: Generate ABAP draft
@@ -263,58 +257,18 @@ def generate_full_abap_program(
         logger.info("✅ All required fields are covered in ABAP output.")
 
     # -----------------------
-    # PASS 4: Detect Custom Tables and Generate Their Structures
-    # -----------------------
-    logger.info("🏗️ Checking for Z* tables or structures to generate definitions...")
-    z_objects = detect_custom_z_objects(all_requirements + "\n" + refined_code)
-
-    table_definitions = ""
-    if z_objects:
-        logger.info(f"📦 Detected custom Z objects: {z_objects}")
-        table_prompt = f"""
-        You are an SAP data dictionary expert.
-        For each of the following Z* custom tables/structures/types, create its definition.
-        Include:
-        - Each field name (based on requirement context)
-        - Data element name (if derivable)
-        - Data type and length (e.g. CHAR10, DEC13,2)
-        - A brief description
-        Format each definition in Markdown, like this:
-
-        ### ZTABLE_NAME
-        | Field Name | Data Element | Data Type | Description |
-        |-------------|--------------|------------|--------------|
-
-        Requirements Context:
-        {all_requirements}
-        ABAP Code Context:
-        {refined_code}
-
-        Z Objects to define:
-        {", ".join(z_objects)}
-        """
-
-        table_response = llm.invoke(table_prompt)
-        table_definitions = table_response.content if hasattr(table_response, "content") else str(table_response)
-        logger.info("📘 Custom Z* table definitions generated successfully.")
-    else:
-        logger.info("✅ No custom Z* tables or structures found in requirements.")
-
-    # -----------------------
-    # PASS 5: Requirement Fulfillment
+    # PASS 4: Requirement Fulfillment
     # -----------------------
     validation_report = validate_requirement_coverage(llm, all_requirements, refined_code)
     logger.info("📊 Requirement coverage validation finished successfully.")
 
     # -----------------------
-    # Combine all output
+    # Return Final Structured Output
     # -----------------------
-    final_output = refined_code
-    if table_definitions:
-        final_output += "\n\n" + "**********************************************************************\n"
-        final_output += "* Auto-Generated Data Dictionary Definitions\n"
-        final_output += "**********************************************************************\n\n"
-        final_output += table_definitions.strip()
-
     logger.info("🏁 ABAP generation process completed successfully.")
-    return final_output
+    # return {
+    #     "abap_code": refined_code,
+        # "field_analysis": field_comparison,
+        # "requirement_validation": validation_report
+    # }
+    return refined_code

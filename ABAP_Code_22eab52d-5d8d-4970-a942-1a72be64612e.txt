@@ -1,0 +1,77 @@
+REPORT zmm_po_close.
+
+TABLES: ekko, ekpo, mara, lfa1.
+
+TYPES: BEGIN OF ty_po,
+         ebeln TYPE ekko-ebeln,
+         matnr TYPE mara-matnr,
+         werks TYPE ekpo-werks,
+         lifnr TYPE lfa1-lifnr,
+         elikz TYPE ekpo-elikz,
+       END OF ty_po.
+
+DATA: lt_po TYPE TABLE OF ty_po,
+      ls_po TYPE ty_po,
+      lt_selected TYPE STANDARD TABLE OF ty_po.
+
+SELECT-OPTIONS: s_matnr FOR ls_po-matnr,
+                s_werks FOR ls_po-werks OBLIGATORY,
+                s_lifnr FOR ls_po-lifnr,
+                s_mtart FOR mara-mtart.
+
+START-OF-SELECTION.
+
+  " Fetch materials based on material type
+  DATA: lt_materials TYPE TABLE OF mara-matnr.
+  IF s_mtart[] IS NOT INITIAL.
+    SELECT matnr FROM mara
+      INTO TABLE lt_materials
+      WHERE mtart IN s_mtart.
+  ENDIF.
+
+  " Fetch purchase orders based on vendor
+  DATA: lt_po_numbers TYPE TABLE OF ekko-ebeln.
+  IF s_lifnr[] IS NOT INITIAL.
+    SELECT ebeln FROM ekko
+      INTO TABLE lt_po_numbers
+      WHERE lifnr IN s_lifnr.
+  ENDIF.
+
+  " Fetch purchase order items based on selection criteria
+  SELECT ebeln, matnr, werks, lifnr, elikz
+    FROM ekpo
+    INTO TABLE lt_po
+    WHERE werks IN s_werks
+      AND ( matnr IN s_matnr OR ( s_mtart[] IS NOT INITIAL AND matnr IN lt_materials ) )
+      AND ( ebeln IN lt_po_numbers OR ( s_lifnr[] IS INITIAL ) )
+      AND elikz = ''.
+
+  " Display ALV output
+  IF lt_po IS NOT INITIAL.
+    CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+      EXPORTING
+        i_structure_name = 'TY_PO'
+        it_outtab       = lt_po
+        is_layout        = 'ALV Layout'
+      TABLES
+        it_fieldcat     = it_fieldcat
+      EXCEPTIONS
+        OTHERS          = 1.
+  ELSE.
+    MESSAGE 'No open POs found' TYPE 'I'.
+  ENDIF.
+
+END-OF-SELECTION.
+
+AT USER-COMMAND.
+
+  CASE sy-ucomm.
+    WHEN 'CLOSE'.
+      LOOP AT lt_po INTO ls_po WHERE elikz = ''.
+        " Update selected entries to close POs
+        UPDATE ekpo SET elikz = 'X'
+          WHERE ebeln = ls_po-ebeln AND matnr = ls_po-matnr AND werks = ls_po-werks.
+      ENDLOOP.
+      COMMIT WORK.
+      MESSAGE 'Selected POs closed successfully' TYPE 'S'.
+  ENDCASE.

@@ -1,0 +1,230 @@
+SECTION 1 - ABAP REPORT PROGRAM
+REPORT zmm_mat_vendor_plant_alv.
+
+*----------------------------------------------------------------------
+*  Material/Vendor/Plant Overview - ALV
+*  - Selection:
+*      S_MATNR: Material Number Range
+*      S_WERKS: Plant Range (Mandatory)
+*      S_LIFNR: Vendor Range
+*      S_MTART: Material Type Range
+*  - Output: ALV Grid (sorting, filtering, subtotalling, export, layout)
+*  - Presentation: SAP GUI and SAP GUI for HTML (Fiori Launchpad)
+*----------------------------------------------------------------------
+*  Author:    <Your Name>
+*  Created:   <Date>
+*  Purpose:   Display materials with plant data and vendor info/price
+*----------------------------------------------------------------------
+
+*----------------------------------------------------------------------
+* Types and Data Declarations
+*----------------------------------------------------------------------
+TYPES: BEGIN OF ty_out,
+         matnr TYPE mara-matnr,      " Material
+         maktx TYPE makt-maktx,      " Material Description
+         mtart TYPE mara-mtart,      " Material Type
+         matkl TYPE mara-matkl,      " Material Group
+         meins TYPE mara-meins,      " Base UoM
+         werks TYPE marc-werks,      " Plant
+         dismm TYPE marc-dismm,      " MRP Type
+         beskz TYPE marc-beskz,      " Procurement Type
+         lifnr TYPE lfa1-lifnr,      " Vendor
+         name1 TYPE lfa1-name1,      " Vendor Name
+         infnr TYPE eina-infnr,      " Info Record
+         ekorg TYPE eine-ekorg,      " Purchasing Org
+         netpr TYPE eine-netpr,      " Net Price
+         waers TYPE eine-waers,      " Currency
+         peinh TYPE eine-peinh,      " Price Unit
+       END OF ty_out.
+
+DATA: gt_out TYPE STANDARD TABLE OF ty_out WITH DEFAULT KEY.
+
+DATA: go_alv     TYPE REF TO cl_salv_table,
+      go_funcs   TYPE REF TO cl_salv_functions,
+      go_cols    TYPE REF TO cl_salv_columns_table,
+      go_col     TYPE REF TO cl_salv_column_table,
+      go_layout  TYPE REF TO cl_salv_layout,
+      go_sorts   TYPE REF TO cl_salv_sorts,
+      go_aggr    TYPE REF TO cl_salv_aggregations.
+
+DATA: lv_title        TYPE string,
+      lv_matnr_empty  TYPE abap_bool,
+      lv_mtart_empty  TYPE abap_bool,
+      lv_lifnr_empty  TYPE abap_bool.
+
+CONSTANTS: gc_space TYPE werks_d VALUE space.
+
+*----------------------------------------------------------------------
+* Selection Screen
+*----------------------------------------------------------------------
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-001.
+  SELECT-OPTIONS: s_matnr FOR mara-matnr,
+                  s_werks FOR marc-werks OBLIGATORY,
+                  s_lifnr FOR lfa1-lifnr,
+                  s_mtart FOR mara-mtart.
+SELECTION-SCREEN END OF BLOCK b1.
+
+INITIALIZATION.
+  text-001 = 'Selection Parameters'.
+
+AT SELECTION-SCREEN.
+  "Place additional validations (auth checks, cross-field checks) here if needed.
+
+START-OF-SELECTION.
+  PERFORM get_data.
+  PERFORM display_alv.
+
+*----------------------------------------------------------------------
+* Form Routines
+*----------------------------------------------------------------------
+FORM get_data.
+  CLEAR gt_out.
+
+  "Evaluate optional ranges (to avoid unnecessary WHERE filters)
+  lv_matnr_empty = xsdbool( s_matnr[] IS INITIAL ).
+  lv_mtart_empty = xsdbool( s_mtart[] IS INITIAL ).
+  lv_lifnr_empty = xsdbool( s_lifnr[] IS INITIAL ).
+
+  "Select core dataset
+  SELECT
+    a~matnr,
+    t~maktx,
+    a~mtart,
+    a~matkl,
+    a~meins,
+    c~werks,
+    c~dismm,
+    c~beskz,
+    i~lifnr,
+    v~name1,
+    i~infnr,
+    e~ekorg,
+    e~netpr,
+    e~waers,
+    e~peinh
+    FROM mara AS a
+    INNER JOIN marc AS c
+      ON c~matnr = a~matnr
+    LEFT OUTER JOIN makt AS t
+      ON t~matnr = a~matnr
+     AND t~spras = @sy-langu
+    LEFT OUTER JOIN eina AS i
+      ON i~matnr = a~matnr
+    LEFT OUTER JOIN eine AS e
+      ON e~infnr = i~infnr
+     AND ( e~werks = c~werks OR e~werks = @gc_space ) "Include plant-specific and general info recs
+    LEFT OUTER JOIN lfa1 AS v
+      ON v~lifnr = i~lifnr
+    WHERE c~werks IN @s_werks
+      AND ( @lv_matnr_empty = abap_true OR a~matnr IN @s_matnr )
+      AND ( @lv_mtart_empty = abap_true OR a~mtart IN @s_mtart )
+      AND ( @lv_lifnr_empty = abap_true OR i~lifnr IN @s_lifnr )
+    ORDER BY a~matnr, c~werks, i~lifnr, e~ekorg
+    INTO CORRESPONDING FIELDS OF TABLE @gt_out.
+
+  IF sy-subrc <> 0 OR gt_out IS INITIAL.
+    MESSAGE 'No data found for the given selection.' TYPE 'I'.
+  ENDIF.
+ENDFORM.
+
+FORM display_alv.
+  IF gt_out IS INITIAL.
+    RETURN.
+  ENDIF.
+
+  TRY.
+      cl_salv_table=>factory(
+        IMPORTING
+          r_salv_table = go_alv
+        CHANGING
+          t_table      = gt_out ).
+
+      "Title and display settings
+      lv_title = |Material/Vendor/Plant Overview ({ lines( gt_out ) } rows)|.
+      go_alv->get_display_settings( )->set_list_header( lv_title ).
+      go_alv->get_display_settings( )->set_striped_pattern( abap_true ).
+
+      "Enable standard functions (sort, filter, subtotal, export, layout)
+      go_funcs = go_alv->get_functions( ).
+      go_funcs->set_all( abap_true ).
+
+      "Column handling
+      go_cols = go_alv->get_columns( ).
+      go_cols->set_optimize( abap_true ).
+
+      "Column headers
+      PERFORM set_column_text USING 'MATNR' 'Material'     'Material'     'Material'.
+      PERFORM set_column_text USING 'MAKTX' 'Description'  'Description'  'Description'.
+      PERFORM set_column_text USING 'MTART' 'Mat.Type'     'Mat.Type'     'Material Type'.
+      PERFORM set_column_text USING 'MATKL' 'Mat.Group'    'Mat.Group'    'Material Group'.
+      PERFORM set_column_text USING 'MEINS' 'Base UoM'     'Base UoM'     'Base Unit of Measure'.
+      PERFORM set_column_text USING 'WERKS' 'Plant'        'Plant'        'Plant'.
+      PERFORM set_column_text USING 'DISMM' 'MRP Type'     'MRP Type'     'MRP Type'.
+      PERFORM set_column_text USING 'BESKZ' 'Proc.Type'    'Proc.Type'    'Procurement Type'.
+      PERFORM set_column_text USING 'LIFNR' 'Vendor'       'Vendor'       'Vendor Number'.
+      PERFORM set_column_text USING 'NAME1' 'Vendor Name'  'Vendor Name'  'Vendor Name'.
+      PERFORM set_column_text USING 'INFNR' 'Info Rec.'    'Info Rec.'    'Purchasing Info Record'.
+      PERFORM set_column_text USING 'EKORG' 'POrg'         'POrg'         'Purchasing Org'.
+      PERFORM set_column_text USING 'NETPR' 'Net Price'    'Net Price'    'Net Price'.
+      PERFORM set_column_text USING 'WAERS' 'Currency'     'Currency'     'Currency'.
+      PERFORM set_column_text USING 'PEINH' 'Per'          'Per'          'Price Unit'.
+
+      "Currency reference for amount field
+      go_col ?= go_cols->get_column( 'NETPR' ).
+      go_col->set_currency( 'WAERS' ).
+
+      "Key columns for better readability in ALV
+      TRY.
+          go_col ?= go_cols->get_column( 'MATNR' ).
+          go_col->set_key( abap_true ).
+          go_col ?= go_cols->get_column( 'WERKS' ).
+          go_col->set_key( abap_true ).
+        CATCH cx_salv_not_found.
+          "Ignore if column not found (should not occur)
+      ENDTRY.
+
+      "Layout saving (user and global)
+      DATA(ls_key) = VALUE salv_s_layout_key( report = sy-repid ).
+      go_layout = go_alv->get_layout( ).
+      go_layout->set_key( ls_key ).
+      go_layout->set_save_restriction( if_salv_c_layout=>restrict_none ).
+      go_layout->set_default( abap_true ).
+
+      "Sorting and subtotals
+      go_sorts = go_alv->get_sorts( ).
+      go_sorts->add_sort( columnname = 'WERKS' subtotal = abap_true ).
+      go_sorts->add_sort( columnname = 'LIFNR' subtotal = abap_true ).
+
+      "Aggregation example (technical sum per group)
+      go_aggr = go_alv->get_aggregations( ).
+      TRY.
+          go_aggr->add_aggregation( 'NETPR' ).
+        CATCH cx_salv_data_error.
+          "Ignore if aggregation cannot be applied
+      ENDTRY.
+
+      "Display ALV
+      go_alv->display( ).
+
+    CATCH cx_salv_msg INTO DATA(lx_msg).
+      MESSAGE lx_msg->get_text( ) TYPE 'E'.
+  ENDTRY.
+ENDFORM.
+
+FORM set_column_text USING iv_colname TYPE salv_de_columnname
+                           iv_short   TYPE scrtext_s
+                           iv_medium  TYPE scrtext_m
+                           iv_long    TYPE scrtext_l.
+  TRY.
+      go_col ?= go_cols->get_column( iv_colname ).
+      go_col->set_short_text( iv_short ).
+      go_col->set_medium_text( iv_medium ).
+      go_col->set_long_text( iv_long ).
+    CATCH cx_salv_not_found.
+      "Ignore if column not found
+  ENDTRY.
+ENDFORM.
+
+
+SECTION 2 - CUSTOM OBJECT DEFINITIONS
+No custom objects required for this development.

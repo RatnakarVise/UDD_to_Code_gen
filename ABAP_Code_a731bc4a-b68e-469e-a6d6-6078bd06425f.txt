@@ -1,0 +1,145 @@
+REPORT zmm_po_close.
+
+TABLES: ekko, ekpo, mara, lfa1.
+
+TYPES: BEGIN OF ty_po,
+         ebeln TYPE ekko-ebeln,
+         matnr TYPE mara-matnr,
+         werks TYPE ekpo-werks,
+         lifnr TYPE lfa1-lifnr,
+         elikz TYPE ekpo-elikz,
+       END OF ty_po.
+
+DATA: it_po TYPE TABLE OF ty_po,
+      wa_po TYPE ty_po,
+      it_selected TYPE STANDARD TABLE OF ty_po,
+      lv_subrc TYPE sy-subrc.
+
+SELECT-OPTIONS: s_matnr FOR wa_po-matnr,
+                s_werks FOR wa_po-werks OBLIGATORY,
+                s_lifnr FOR wa_po-lifnr,
+                s_mtart FOR mara-mtart.
+
+START-OF-SELECTION.
+
+  " Fetch materials based on material type
+  DATA: it_materials TYPE TABLE OF mara-matnr,
+        it_po_numbers TYPE TABLE OF ekko-ebeln.
+
+  IF s_mtart[] IS NOT INITIAL.
+    SELECT matnr FROM mara
+      INTO TABLE it_materials
+      WHERE mtart IN s_mtart.
+  ENDIF.
+
+  " Fetch purchase orders based on vendor
+  IF s_lifnr[] IS NOT INITIAL.
+    SELECT ebeln FROM ekko
+      INTO TABLE it_po_numbers
+      WHERE lifnr IN s_lifnr.
+  ENDIF.
+
+  " Fetch purchase order items based on selection criteria
+  SELECT ebeln, matnr, werks, lifnr, elikz
+    INTO TABLE it_po
+    FROM ekpo
+    WHERE elikz = ' ' 
+      AND werks IN s_werks.
+
+  " Filter by materials if provided
+  IF it_materials IS NOT INITIAL.
+    DELETE it_po WHERE matnr NOT IN (SELECT matnr FROM it_materials).
+  ENDIF.
+
+  " Filter by purchase orders if provided
+  IF it_po_numbers IS NOT INITIAL.
+    DELETE it_po WHERE ebeln NOT IN (SELECT ebeln FROM it_po_numbers).
+  ENDIF.
+
+  " Display ALV
+  PERFORM display_alv.
+
+FORM display_alv.
+  DATA: lo_alv TYPE REF TO cl_gui_alv_grid,
+        lt_fieldcat TYPE lvc_t_fcat,
+        ls_fieldcat TYPE lvc_s_fcat,
+        lt_events TYPE slis_t_event,
+        ls_events TYPE slis_alv_event.
+
+  " Field catalog for ALV
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'EBELN'.
+  ls_fieldcat-seltext_m = 'PO Number'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'MATNR'.
+  ls_fieldcat-seltext_m = 'Material Number'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'WERKS'.
+  ls_fieldcat-seltext_m = 'Plant'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'LIFNR'.
+  ls_fieldcat-seltext_m = 'Vendor'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'ELIKZ'.
+  ls_fieldcat-seltext_m = 'Closed'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  " Create ALV Grid
+  CREATE OBJECT lo_alv
+    EXPORTING
+      i_parent = cl_gui_container=>screen0.
+
+  " Set table for ALV
+  CALL METHOD lo_alv->set_table_for_first_display
+    EXPORTING
+      i_structure_name = 'TY_PO'
+      it_fieldcatalog = lt_fieldcat
+    CHANGING
+      it_outtab = it_po.
+
+  " Event for closing selected POs
+  CLEAR ls_events.
+  ls_events-name = 'CLOSE_SELECTED'.
+  ls_events-form = 'CLOSE_SELECTED'.
+  APPEND ls_events TO lt_events.
+
+  lo_alv->register_event( it_events = lt_events ).
+ENDFORM.
+
+FORM close_selected.
+  DATA: lt_selected TYPE STANDARD TABLE OF ty_po.
+
+  " Get selected entries
+  CALL METHOD lo_alv->get_selected_rows
+    IMPORTING
+      et_index_rows = lt_selected.
+
+  LOOP AT lt_selected INTO DATA(wa_selected).
+    READ TABLE it_po INTO wa_po WITH KEY ebeln = wa_selected-ebeln.
+    IF sy-subrc = 0.
+      " Update EKPO to close the PO
+      UPDATE ekpo SET elikz = 'X'
+        WHERE ebeln = wa_po-ebeln
+          AND matnr = wa_po-matnr
+          AND werks = wa_po-werks.
+      lv_subrc = sy-subrc.
+    ENDIF.
+  ENDLOOP.
+
+  " Commit or rollback based on update success
+  IF lv_subrc = 0.
+    COMMIT WORK.
+    MESSAGE 'Selected POs closed successfully.' TYPE 'S'.
+  ELSE.
+    ROLLBACK WORK.
+    MESSAGE 'Error closing selected POs.' TYPE 'E'.
+  ENDIF.
+ENDFORM.

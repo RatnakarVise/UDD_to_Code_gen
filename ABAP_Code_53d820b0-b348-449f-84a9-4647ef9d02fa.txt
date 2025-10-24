@@ -1,0 +1,323 @@
+REPORT zmm_mat_plant_vendor_alv.
+
+TYPE-POOLS: slis.
+
+" Selection screen
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-001.
+SELECT-OPTIONS:
+  s_matnr FOR mara-matnr,
+  s_werks FOR marc-werks OBLIGATORY,
+  s_lifnr FOR lfa1-lifnr,
+  s_mtart FOR mara-mtart.
+SELECTION-SCREEN END OF BLOCK b1.
+
+PARAMETERS p_langu TYPE sylangu DEFAULT sy-langu.
+
+" Types
+TYPES: BEGIN OF ty_base,
+         matnr TYPE mara-matnr,
+         werks TYPE marc-werks,
+         mtart TYPE mara-mtart,
+         matkl TYPE mara-matkl,
+         meins TYPE mara-meins,
+         dispo TYPE marc-dispo,
+       END OF ty_base.
+
+TYPES: BEGIN OF ty_eord,
+         matnr TYPE eord-matnr,
+         werks TYPE eord-werks,
+         lifnr TYPE eord-lifnr,
+         datab TYPE eord-datab,
+         datbi TYPE eord-datbi,
+         fixkz TYPE eord-fixkz,
+       END OF ty_eord.
+
+TYPES: BEGIN OF ty_makt,
+         matnr TYPE makt-matnr,
+         maktx TYPE makt-maktx,
+       END OF ty_makt.
+
+TYPES: BEGIN OF ty_lfa1,
+         lifnr TYPE lfa1-lifnr,
+         name1 TYPE lfa1-name1,
+       END OF ty_lfa1.
+
+TYPES: BEGIN OF ty_alv,
+         matnr TYPE mara-matnr,   "Material Number
+         maktx TYPE makt-maktx,   "Material Description
+         werks TYPE marc-werks,   "Plant
+         mtart TYPE mara-mtart,   "Material Type
+         matkl TYPE mara-matkl,   "Material Group
+         meins TYPE mara-meins,   "Base Unit
+         dispo TYPE marc-dispo,   "MRP Controller
+         lifnr TYPE lfa1-lifnr,   "Vendor
+         name1 TYPE lfa1-name1,   "Vendor Name
+         cnt   TYPE i,            "Counter for subtotals
+       END OF ty_alv.
+
+TYPES: BEGIN OF ty_vendor_map,
+         matnr TYPE eord-matnr,
+         werks TYPE eord-werks,
+         lifnr TYPE eord-lifnr,
+       END OF ty_vendor_map.
+
+" Data
+DATA: lt_base        TYPE STANDARD TABLE OF ty_base WITH DEFAULT KEY,
+      lt_eord        TYPE STANDARD TABLE OF ty_eord WITH DEFAULT KEY,
+      lt_makt        TYPE SORTED   TABLE OF ty_makt WITH UNIQUE KEY matnr,
+      lt_lfa1        TYPE SORTED   TABLE OF ty_lfa1 WITH UNIQUE KEY lifnr,
+      lt_alv         TYPE STANDARD TABLE OF ty_alv WITH DEFAULT KEY,
+      lt_vendor_map  TYPE HASHED   TABLE OF ty_vendor_map WITH UNIQUE KEY matnr werks.
+
+DATA: ls_layout   TYPE slis_layout_alv,
+      lt_fieldcat TYPE slis_t_fieldcat_alv,
+      ls_fieldcat TYPE slis_fieldcat_alv,
+      lt_sort     TYPE slis_t_sortinfo_alv,
+      ls_sort     TYPE slis_sortinfo_alv,
+      ls_variant  TYPE disvariant.
+
+" Events
+START-OF-SELECTION.
+  PERFORM get_data.
+  PERFORM prepare_alv.
+  PERFORM display_alv.
+
+"---------------------------
+" Get data and build output
+"---------------------------
+FORM get_data.
+
+  DATA lv_lines TYPE i.
+
+  " 1) Read base data (MARC + MARA) filtered by plant/material/material type
+  SELECT a~matnr,
+         a~werks,
+         b~mtart,
+         b~matkl,
+         b~meins,
+         a~dispo
+    FROM marc AS a
+    INNER JOIN mara AS b
+      ON b~matnr = a~matnr
+    INTO TABLE @lt_base
+    WHERE a~werks IN @s_werks
+      AND a~matnr IN @s_matnr
+      AND b~mtart IN @s_mtart.
+
+  IF sy-subrc <> 0.
+    MESSAGE 'No data found for given selection' TYPE 'I'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+  DESCRIBE TABLE lt_base LINES lv_lines.
+  IF lv_lines = 0.
+    MESSAGE 'No data found for given selection' TYPE 'I'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+  " 2) Read language-dependent material descriptions (MAKT)
+  SELECT matnr,
+         maktx
+    FROM makt
+    INTO TABLE @lt_makt
+    FOR ALL ENTRIES IN @lt_base
+    WHERE matnr = @lt_base-matnr
+      AND spras = @p_langu.
+
+  " 3) Read valid source list entries (EORD), prefer fixed source (FIXKZ = 'X')
+  SELECT matnr,
+         werks,
+         lifnr,
+         datab,
+         datbi,
+         fixkz
+    FROM eord
+    INTO TABLE @lt_eord
+    FOR ALL ENTRIES IN @lt_base
+    WHERE matnr = @lt_base-matnr
+      AND werks = @lt_base-werks
+      AND datab <= @sy-datum
+      AND datbi >= @sy-datum
+      AND lifnr IN @s_lifnr.
+
+  " 4) Build vendor map (first per MATNR/WERKS, fixed prioritized)
+  SORT lt_eord BY matnr werks fixkz DESCENDING.
+  LOOP AT lt_eord INTO DATA(ls_eord).
+    READ TABLE lt_vendor_map WITH TABLE KEY matnr = ls_eord-matnr werks = ls_eord-werks TRANSPORTING NO FIELDS.
+    IF sy-subrc <> 0.
+      INSERT VALUE ty_vendor_map( matnr = ls_eord-matnr
+                                  werks = ls_eord-werks
+                                  lifnr = ls_eord-lifnr ) INTO TABLE lt_vendor_map.
+    ENDIF.
+  ENDLOOP.
+
+  " 5) Collect vendors to read names from LFA1 (based on vendor map and selection)
+  DATA lt_lifnr_keys TYPE SORTED TABLE OF lfa1-lifnr WITH UNIQUE KEY table_line.
+  LOOP AT lt_vendor_map INTO DATA(ls_vmap).
+    IF s_lifnr IS INITIAL OR ls_vmap-lifnr IN s_lifnr.
+      INSERT ls_vmap-lifnr INTO TABLE lt_lifnr_keys.
+    ENDIF.
+  ENDLOOP.
+
+  IF lt_lifnr_keys IS NOT INITIAL.
+    SELECT lifnr,
+           name1
+      FROM lfa1
+      INTO TABLE @lt_lfa1
+      FOR ALL ENTRIES IN @lt_lifnr_keys
+      WHERE lifnr = @lt_lifnr_keys-table_line.
+  ENDIF.
+
+  " 6) Build ALV output (apply vendor filter if provided; include vendorless rows if not)
+  DATA ls_alv TYPE ty_alv.
+
+  LOOP AT lt_base ASSIGNING FIELD-SYMBOL(<ls_base>).
+
+    CLEAR ls_alv.
+    ls_alv-matnr = <ls_base>-matnr.
+    ls_alv-werks = <ls_base>-werks.
+    ls_alv-mtart = <ls_base>-mtart.
+    ls_alv-matkl = <ls_base>-matkl.
+    ls_alv-meins = <ls_base>-meins.
+    ls_alv-dispo = <ls_base>-dispo.
+
+    " Material description
+    READ TABLE lt_makt INTO DATA(ls_makt) WITH TABLE KEY matnr = <ls_base>-matnr.
+    IF sy-subrc = 0.
+      ls_alv-maktx = ls_makt-maktx.
+    ENDIF.
+
+    " Determine vendor (from vendor map)
+    READ TABLE lt_vendor_map INTO DATA(ls_vmap2) WITH TABLE KEY matnr = <ls_base>-matnr werks = <ls_base>-werks.
+    IF sy-subrc = 0.
+      ls_alv-lifnr = ls_vmap2-lifnr.
+    ENDIF.
+
+    " Apply vendor selection: if S_LIFNR provided, keep only rows with matching vendor
+    IF s_lifnr IS NOT INITIAL.
+      IF ls_alv-lifnr IS INITIAL OR NOT ( ls_alv-lifnr IN s_lifnr ).
+        CONTINUE.
+      ENDIF.
+    ENDIF.
+
+    " Vendor name
+    IF ls_alv-lifnr IS NOT INITIAL AND lt_lfa1 IS NOT INITIAL.
+      READ TABLE lt_lfa1 INTO DATA(ls_lfa1) WITH TABLE KEY lifnr = ls_alv-lifnr.
+      IF sy-subrc = 0.
+        ls_alv-name1 = ls_lfa1-name1.
+      ENDIF.
+    ENDIF.
+
+    " Counter for subtotals
+    ls_alv-cnt = 1.
+
+    APPEND ls_alv TO lt_alv.
+
+  ENDLOOP.
+
+  " 7) Final check and sort output
+  IF lt_alv IS INITIAL.
+    MESSAGE 'No data found for given selection' TYPE 'I'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+  SORT lt_alv BY werks lifnr matnr.
+
+ENDFORM.
+
+"---------------------------
+" Prepare ALV layout/catalog
+"---------------------------
+FORM prepare_alv.
+
+  CLEAR: lt_fieldcat, lt_sort, ls_layout.
+
+  " Layout settings
+  ls_layout-zebra             = 'X'.
+  ls_layout-colwidth_optimize = 'X'.
+  ls_layout-box_fieldname     = ''. "No checkbox
+  ls_layout-totals_text       = 'Subtotal'.
+
+  " Field catalog
+  PERFORM add_field USING 'MATNR' 'Material'         10 '' 'X' '' '' '' ''.
+  PERFORM add_field USING 'MAKTX' 'Description'      40 '' ''  '' '' '' ''.
+  PERFORM add_field USING 'WERKS' 'Plant'            10 '' 'X' '' '' '' ''.
+  PERFORM add_field USING 'MTART' 'Material Type'    10 '' ''  '' '' '' ''.
+  PERFORM add_field USING 'MATKL' 'Material Group'   10 '' ''  '' '' '' ''.
+  PERFORM add_field USING 'MEINS' 'Base Unit'         6 '' ''  '' '' '' ''.
+  PERFORM add_field USING 'DISPO' 'MRP Ctrl.'         6 '' ''  '' '' '' ''.
+  PERFORM add_field USING 'LIFNR' 'Vendor'           10 '' 'X' '' '' '' ''.
+  PERFORM add_field USING 'NAME1' 'Vendor Name'      25 '' ''  '' '' '' ''.
+  PERFORM add_field USING 'CNT'   'Count'             5 '' ''  'X' '' '' ''.
+
+  " Sorting and subtotals (subtotal at Vendor within Plant)
+  CLEAR ls_sort.
+  ls_sort-fieldname  = 'WERKS'.
+  ls_sort-up         = 'X'.
+  ls_sort-subtot     = 'X'.
+  APPEND ls_sort TO lt_sort.
+
+  CLEAR ls_sort.
+  ls_sort-fieldname  = 'LIFNR'.
+  ls_sort-up         = 'X'.
+  ls_sort-subtot     = 'X'.
+  APPEND ls_sort TO lt_sort.
+
+  " Variant (layout saving)
+  ls_variant-report = sy-repid.
+
+ENDFORM.
+
+"---------------------------
+" Helper to add a field to ALV
+"---------------------------
+FORM add_field USING    p_fieldname TYPE slis_fieldname
+                        p_scrtext   TYPE scrtext_l
+                        p_outputlen TYPE i
+                        p_hotspot   TYPE c
+                        p_key       TYPE c
+                        p_do_sum    TYPE c
+                        p_no_out    TYPE c
+                        p_edit      TYPE c
+                        p_ref_tab   TYPE c
+                        p_ref_fld   TYPE c.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname        = p_fieldname.
+  ls_fieldcat-seltext_l        = p_scrtext.
+  ls_fieldcat-outputlen        = p_outputlen.
+  ls_fieldcat-hotspot          = p_hotspot.
+  ls_fieldcat-key              = p_key.
+  ls_fieldcat-do_sum           = p_do_sum.
+  ls_fieldcat-no_out           = p_no_out.
+  ls_fieldcat-edit             = p_edit.
+  ls_fieldcat-ref_tabname      = p_ref_tab.
+  ls_fieldcat-ref_fieldname    = p_ref_fld.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+ENDFORM.
+
+"---------------------------
+" Display ALV grid
+"---------------------------
+FORM display_alv.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program = sy-repid
+      is_layout          = ls_layout
+      it_fieldcat        = lt_fieldcat
+      is_variant         = ls_variant
+      i_save             = 'A'           "Allow saving layouts variants
+      it_sort            = lt_sort
+    TABLES
+      t_outtab           = lt_alv
+    EXCEPTIONS
+      program_error      = 1
+      OTHERS             = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+       WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.

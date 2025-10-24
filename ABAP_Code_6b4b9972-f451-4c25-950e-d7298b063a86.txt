@@ -1,0 +1,446 @@
+REPORT zmm_mat_vendor_alv.
+
+*----------------------------------------------------------------------
+* Tables
+*----------------------------------------------------------------------
+TABLES: mara, makt, eord, lfa1, t001w, t134t.
+
+*----------------------------------------------------------------------
+* Types
+*----------------------------------------------------------------------
+TYPES: BEGIN OF ty_eord,
+         matnr TYPE eord-matnr,
+         werks TYPE eord-werks,
+         lifnr TYPE eord-lifnr,
+         infnr TYPE eord-infnr,
+         vdatu TYPE eord-vdatu,
+         bdatu TYPE eord-bdatu,
+         fixkz TYPE eord-fixkz,
+       END OF ty_eord.
+
+TYPES: BEGIN OF ty_mara,
+         matnr TYPE mara-matnr,
+         mtart TYPE mara-mtart,
+         meins TYPE mara-meins,
+       END OF ty_mara.
+
+TYPES: BEGIN OF ty_makt,
+         matnr TYPE makt-matnr,
+         maktx TYPE makt-maktx,
+       END OF ty_makt.
+
+TYPES: BEGIN OF ty_lfa1,
+         lifnr TYPE lfa1-lifnr,
+         name1 TYPE lfa1-name1,
+       END OF ty_lfa1.
+
+TYPES: BEGIN OF ty_t001w,
+         werks TYPE t001w-werks,
+         name1 TYPE t001w-name1,
+       END OF ty_t001w.
+
+TYPES: BEGIN OF ty_t134t,
+         mtart TYPE t134t-mtart,
+         spras TYPE t134t-spras,
+         mtbez TYPE t134t-mtbez,
+       END OF ty_t134t.
+
+TYPES: BEGIN OF ty_alv,
+         werks          TYPE werks_d,
+         plant_name     TYPE t001w-name1,
+         matnr          TYPE matnr,
+         maktx          TYPE maktx,
+         mtart          TYPE mtart,
+         mtart_text     TYPE t134t-mtbez,
+         meins          TYPE meins,
+         lifnr          TYPE lifnr,
+         vendor_name    TYPE lfa1-name1,
+         infnr          TYPE eord-infnr,
+         vdatu          TYPE eord-vdatu,
+         bdatu          TYPE eord-bdatu,
+         fixkz          TYPE eord-fixkz,
+         validity_days  TYPE i,
+       END OF ty_alv.
+
+*----------------------------------------------------------------------
+* Data
+*----------------------------------------------------------------------
+DATA: gt_eord   TYPE STANDARD TABLE OF ty_eord WITH DEFAULT KEY,
+      gt_mara   TYPE HASHED   TABLE OF ty_mara  WITH UNIQUE KEY matnr,
+      gt_makt   TYPE HASHED   TABLE OF ty_makt  WITH UNIQUE KEY matnr,
+      gt_lfa1   TYPE HASHED   TABLE OF ty_lfa1  WITH UNIQUE KEY lifnr,
+      gt_t001w  TYPE HASHED   TABLE OF ty_t001w WITH UNIQUE KEY werks,
+      gt_t134t  TYPE HASHED   TABLE OF ty_t134t WITH UNIQUE KEY mtart spras.
+
+DATA: gt_alv     TYPE STANDARD TABLE OF ty_alv WITH DEFAULT KEY,
+      gt_fieldcat TYPE lvc_t_fcat,
+      gs_layout   TYPE lvc_s_layo,
+      gt_sort     TYPE lvc_t_sort,
+      gs_variant  TYPE disvariant.
+
+DATA gv_repid TYPE syrepid VALUE sy-repid.
+
+*----------------------------------------------------------------------
+* Selection Screen
+*----------------------------------------------------------------------
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-t01.
+SELECT-OPTIONS:
+  s_matnr FOR mara-matnr,
+  s_werks FOR t001w-werks OBLIGATORY,
+  s_lifnr FOR lfa1-lifnr,
+  s_mtart FOR mara-mtart.
+SELECTION-SCREEN END OF BLOCK b1.
+
+SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE text-t02.
+PARAMETERS p_layvar TYPE disvariant-variant DEFAULT space.
+SELECTION-SCREEN END OF BLOCK b2.
+
+INITIALIZATION.
+  text-t01 = 'Selection Criteria'.
+  text-t02 = 'Layout Variant (optional for saving)'.
+
+AT SELECTION-SCREEN.
+  "No additional validations required as S_WERKS is obligatory.
+
+*----------------------------------------------------------------------
+* Start-of-selection
+*----------------------------------------------------------------------
+START-OF-SELECTION.
+  PERFORM get_data.
+  IF gt_alv IS INITIAL.
+    MESSAGE 'No data found for given selection.' TYPE 'S'.
+    RETURN.
+  ENDIF.
+
+  PERFORM build_fieldcatalog.
+  PERFORM build_sort.
+  PERFORM set_layout.
+  PERFORM display_alv.
+
+*----------------------------------------------------------------------
+* Forms
+*----------------------------------------------------------------------
+FORM get_data.
+  DATA lt_eord TYPE STANDARD TABLE OF ty_eord WITH DEFAULT KEY.
+
+  "Read source list entries with optional filters on material and vendor
+  IF s_matnr[] IS INITIAL AND s_lifnr[] IS INITIAL.
+    SELECT matnr werks lifnr infnr vdatu bdatu fixkz
+      FROM eord
+      INTO TABLE @lt_eord
+      WHERE werks IN @s_werks.
+  ELSEIF s_matnr[] IS INITIAL.
+    SELECT matnr werks lifnr infnr vdatu bdatu fixkz
+      FROM eord
+      INTO TABLE @lt_eord
+      WHERE werks IN @s_werks
+        AND lifnr IN @s_lifnr.
+  ELSEIF s_lifnr[] IS INITIAL.
+    SELECT matnr werks lifnr infnr vdatu bdatu fixkz
+      FROM eord
+      INTO TABLE @lt_eord
+      WHERE werks IN @s_werks
+        AND matnr IN @s_matnr.
+  ELSE.
+    SELECT matnr werks lifnr infnr vdatu bdatu fixkz
+      FROM eord
+      INTO TABLE @lt_eord
+      WHERE werks IN @s_werks
+        AND matnr IN @s_matnr
+        AND lifnr IN @s_lifnr.
+  ENDIF.
+
+  IF lt_eord IS INITIAL.
+    CLEAR gt_alv.
+    RETURN.
+  ENDIF.
+
+  gt_eord = lt_eord.
+
+  "Collect unique keys for subsequent reads
+  DATA: lt_matnr TYPE SORTED TABLE OF matnr    WITH UNIQUE KEY table_line,
+        lt_lifnr TYPE SORTED TABLE OF lifnr    WITH UNIQUE KEY table_line,
+        lt_werks TYPE SORTED TABLE OF werks_d  WITH UNIQUE KEY table_line.
+
+  LOOP AT gt_eord ASSIGNING FIELD-SYMBOL(<ls_eord>).
+    INSERT <ls_eord>-matnr INTO TABLE lt_matnr.
+    INSERT <ls_eord>-lifnr INTO TABLE lt_lifnr.
+    INSERT <ls_eord>-werks INTO TABLE lt_werks.
+  ENDLOOP.
+
+  "Fetch material basic data
+  IF lt_matnr IS NOT INITIAL.
+    SELECT matnr mtart meins
+      FROM mara
+      INTO TABLE @DATA(lt_mara)
+      FOR ALL ENTRIES IN @lt_matnr
+      WHERE matnr = @lt_matnr-table_line.
+    IF sy-subrc = 0.
+      gt_mara = lt_mara.
+    ENDIF.
+
+    "Fetch material descriptions (logon language)
+    SELECT matnr maktx
+      FROM makt
+      INTO TABLE @DATA(lt_makt)
+      FOR ALL ENTRIES IN @lt_matnr
+      WHERE matnr = @lt_matnr-table_line
+        AND spras = @sy-langu.
+    IF sy-subrc = 0.
+      gt_makt = lt_makt.
+    ENDIF.
+  ENDIF.
+
+  "Flag to apply material type filter later
+  DATA(lv_filter_mtart) = xsdbool( s_mtart[] IS NOT INITIAL ).
+
+  "Fetch vendor names
+  IF lt_lifnr IS NOT INITIAL.
+    SELECT lifnr name1
+      FROM lfa1
+      INTO TABLE @DATA(lt_lfa1)
+      FOR ALL ENTRIES IN @lt_lifnr
+      WHERE lifnr = @lt_lifnr-table_line.
+    IF sy-subrc = 0.
+      gt_lfa1 = lt_lfa1.
+    ENDIF.
+  ENDIF.
+
+  "Fetch plant names
+  IF lt_werks IS NOT INITIAL.
+    SELECT werks name1
+      FROM t001w
+      INTO TABLE @DATA(lt_t001w)
+      FOR ALL ENTRIES IN @lt_werks
+      WHERE werks = @lt_werks-table_line.
+    IF sy-subrc = 0.
+      gt_t001w = lt_t001w.
+    ENDIF.
+  ENDIF.
+
+  "Fetch material type texts (logon language)
+  IF gt_mara IS NOT INITIAL.
+    DATA lt_mtart TYPE SORTED TABLE OF mtart WITH UNIQUE KEY table_line.
+    LOOP AT gt_mara ASSIGNING FIELD-SYMBOL(<ls_mara_key>).
+      INSERT <ls_mara_key>-mtart INTO TABLE lt_mtart.
+    ENDLOOP.
+
+    IF lt_mtart IS NOT INITIAL.
+      SELECT mtart spras mtbez
+        FROM t134t
+        INTO TABLE @DATA(lt_t134t)
+        FOR ALL ENTRIES IN @lt_mtart
+        WHERE mtart = @lt_mtart-table_line
+          AND spras = @sy-langu.
+      IF sy-subrc = 0.
+        gt_t134t = lt_t134t.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  "Assemble ALV output
+  CLEAR gt_alv.
+  LOOP AT gt_eord ASSIGNING <ls_eord>.
+    DATA(ls_alv) = VALUE ty_alv( ).
+
+    "Read material basic; skip if not found
+    READ TABLE gt_mara ASSIGNING FIELD-SYMBOL(<ls_mara>)
+         WITH TABLE KEY matnr = <ls_eord>-matnr.
+    IF sy-subrc <> 0.
+      CONTINUE.
+    ENDIF.
+
+    "Apply material type filter if provided
+    IF lv_filter_mtart = abap_true AND ( NOT <ls_mara>-mtart IN s_mtart ).
+      CONTINUE.
+    ENDIF.
+
+    "Plant and name
+    ls_alv-werks = <ls_eord>-werks.
+    READ TABLE gt_t001w ASSIGNING FIELD-SYMBOL(<ls_plant>)
+         WITH TABLE KEY werks = <ls_eord>-werks.
+    IF sy-subrc = 0.
+      ls_alv-plant_name = <ls_plant>-name1.
+    ENDIF.
+
+    "Material and description
+    ls_alv-matnr = <ls_eord>-matnr.
+    READ TABLE gt_makt ASSIGNING FIELD-SYMBOL(<ls_makt>)
+         WITH TABLE KEY matnr = <ls_eord>-matnr.
+    IF sy-subrc = 0.
+      ls_alv-maktx = <ls_makt>-maktx.
+    ENDIF.
+
+    "Material type and text
+    ls_alv-mtart = <ls_mara>-mtart.
+    READ TABLE gt_t134t ASSIGNING FIELD-SYMBOL(<ls_t134t>)
+         WITH TABLE KEY mtart = <ls_mara>-mtart spras = sy-langu.
+    IF sy-subrc = 0.
+      ls_alv-mtart_text = <ls_t134t>-mtbez.
+    ENDIF.
+
+    "Base unit
+    ls_alv-meins = <ls_mara>-meins.
+
+    "Vendor and name
+    ls_alv-lifnr = <ls_eord>-lifnr.
+    READ TABLE gt_lfa1 ASSIGNING FIELD-SYMBOL(<ls_lfa1>)
+         WITH TABLE KEY lifnr = <ls_eord>-lifnr.
+    IF sy-subrc = 0.
+      ls_alv-vendor_name = <ls_lfa1>-name1.
+    ENDIF.
+
+    "Info record and validity
+    ls_alv-infnr = <ls_eord>-infnr.
+    ls_alv-vdatu = <ls_eord>-vdatu.
+    ls_alv-bdatu = <ls_eord>-bdatu.
+    ls_alv-fixkz = <ls_eord>-fixkz.
+
+    "Compute validity days (inclusive)
+    IF ls_alv-vdatu IS NOT INITIAL
+       AND ls_alv-bdatu IS NOT INITIAL
+       AND ls_alv-bdatu >= ls_alv-vdatu.
+      DATA(lv_days) = 0.
+      CALL FUNCTION 'DAYS_BETWEEN_TWO_DATES'
+        EXPORTING
+          i_datum_bis = ls_alv-bdatu
+          i_datum_von = ls_alv-vdatu
+        IMPORTING
+          e_tage      = lv_days
+        EXCEPTIONS
+          OTHERS      = 1.
+      IF sy-subrc = 0.
+        ls_alv-validity_days = lv_days + 1.
+      ENDIF.
+    ENDIF.
+
+    APPEND ls_alv TO gt_alv.
+  ENDLOOP.
+ENDFORM.
+
+FORM build_fieldcatalog.
+  CLEAR gt_fieldcat.
+
+  "Key and identification fields
+  PERFORM add_fcat USING 'WERKS'         'EORD'  'WERKS'  'Plant'                      ' ' 'X' ' ' ' ' ' ' ' '.
+  PERFORM add_fcat USING 'PLANT_NAME'    ''      ''       'Plant Name'                 ' ' ' ' ' ' ' ' ' ' ' '.
+  PERFORM add_fcat USING 'MATNR'         'MARA'  'MATNR'  'Material'                   ' ' 'X' ' ' ' ' ' ' ' '.
+  PERFORM add_fcat USING 'MAKTX'         'MAKT'  'MAKTX'  'Material Description'       ' ' ' ' ' ' ' ' ' ' ' '.
+  PERFORM add_fcat USING 'MTART'         'MARA'  'MTART'  'Material Type'              ' ' ' ' ' ' ' ' ' ' ' '.
+  PERFORM add_fcat USING 'MTART_TEXT'    'T134T' 'MTBEZ'  'Material Type Text'         ' ' ' ' ' ' ' ' ' ' ' '.
+  PERFORM add_fcat USING 'MEINS'         'MARA'  'MEINS'  'Base Unit'                  ' ' ' ' ' ' ' ' ' ' ' '.
+
+  "Vendor-related fields
+  PERFORM add_fcat USING 'LIFNR'         'LFA1'  'LIFNR'  'Vendor'                     ' ' 'X' ' ' ' ' ' ' ' '.
+  PERFORM add_fcat USING 'VENDOR_NAME'   'LFA1'  'NAME1'  'Vendor Name'                ' ' ' ' ' ' ' ' ' ' ' '.
+  PERFORM add_fcat USING 'INFNR'         'EORD'  'INFNR'  'Info Record'                ' ' ' ' ' ' ' ' ' ' ' '.
+
+  "Validity fields
+  PERFORM add_fcat USING 'VDATU'         'EORD'  'VDATU'  'Valid From'                 ' ' ' ' ' ' ' ' ' ' ' '.
+  PERFORM add_fcat USING 'BDATU'         'EORD'  'BDATU'  'Valid To'                   ' ' ' ' ' ' ' ' ' ' ' '.
+  PERFORM add_fcat USING 'FIXKZ'         'EORD'  'FIXKZ'  'Fixed Source'               'X' ' ' ' ' ' ' ' ' ' '.
+  PERFORM add_fcat USING 'VALIDITY_DAYS' ''      ''       'Validity Days (Inclusive)'  ' ' ' ' 'X' ' ' ' ' ' '.
+ENDFORM.
+
+FORM add_fcat USING    p_fieldname  TYPE lvc_fname
+                        p_reftab     TYPE tabname
+                        p_reffld     TYPE fieldname
+                        p_coltext    TYPE scrtext_l
+                        p_checkbox   TYPE char1
+                        p_key        TYPE char1
+                        p_do_sum     TYPE char1
+                        p_hotspot    TYPE char1
+                        p_no_out     TYPE char1
+                        p_edit       TYPE char1.
+  DATA ls_fcat TYPE lvc_s_fcat.
+
+  CLEAR ls_fcat.
+  ls_fcat-fieldname = p_fieldname.
+
+  IF p_reftab IS NOT INITIAL AND p_reffld IS NOT INITIAL.
+    ls_fcat-ref_table = p_reftab.
+    ls_fcat-ref_field = p_reffld.
+  ENDIF.
+
+  ls_fcat-coltext   = p_coltext.
+  ls_fcat-scrtext_l = p_coltext.
+  ls_fcat-scrtext_m = p_coltext.
+  ls_fcat-scrtext_s = p_coltext.
+
+  IF p_checkbox = 'X'.
+    ls_fcat-checkbox = 'X'.
+    ls_fcat-edit     = ' '.
+  ENDIF.
+  IF p_key = 'X'.
+    ls_fcat-key = 'X'.
+  ENDIF.
+  IF p_do_sum = 'X'.
+    ls_fcat-do_sum = 'X'.
+  ENDIF.
+  IF p_hotspot = 'X'.
+    ls_fcat-hotspot = 'X'.
+  ENDIF.
+  IF p_no_out = 'X'.
+    ls_fcat-no_out = 'X'.
+  ENDIF.
+  IF p_edit = 'X'.
+    ls_fcat-edit = 'X'.
+  ENDIF.
+
+  APPEND ls_fcat TO gt_fieldcat.
+ENDFORM.
+
+FORM build_sort.
+  CLEAR gt_sort.
+
+  DATA ls_sort TYPE lvc_s_sort.
+
+  CLEAR ls_sort.
+  ls_sort-fieldname = 'WERKS'.
+  ls_sort-up        = 'X'.
+  ls_sort-subtot    = 'X'.
+  APPEND ls_sort TO gt_sort.
+
+  CLEAR ls_sort.
+  ls_sort-fieldname = 'MATNR'.
+  ls_sort-up        = 'X'.
+  APPEND ls_sort TO gt_sort.
+
+  CLEAR ls_sort.
+  ls_sort-fieldname = 'LIFNR'.
+  ls_sort-up        = 'X'.
+  APPEND ls_sort TO gt_sort.
+ENDFORM.
+
+FORM set_layout.
+  CLEAR gs_layout.
+  gs_layout-zebra      = 'X'.
+  gs_layout-cwidth_opt = 'X'.
+
+  CLEAR gs_variant.
+  gs_variant-report  = gv_repid.
+  gs_variant-variant = p_layvar.
+ENDFORM.
+
+FORM display_alv.
+  DATA lv_title TYPE lvc_title VALUE 'Material-Vendor Source List Overview'.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY_LVC'
+    EXPORTING
+      i_callback_program = gv_repid
+      is_layout_lvc      = gs_layout
+      it_fieldcat_lvc    = gt_fieldcat
+      it_sort_lvc        = gt_sort
+      i_save             = 'A'
+      is_variant         = gs_variant
+      i_default          = 'X'
+      i_grid_title       = lv_title
+    TABLES
+      t_outtab           = gt_alv
+    EXCEPTIONS
+      program_error      = 1
+      OTHERS             = 2.
+  IF sy-subrc <> 0.
+    MESSAGE 'Error displaying ALV' TYPE 'E'.
+  ENDIF.
+ENDFORM.

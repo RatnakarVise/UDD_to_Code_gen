@@ -1,0 +1,278 @@
+SECTION 1 - ABAP REPORT PROGRAM
+REPORT zmm_mat_vendor_alv NO STANDARD PAGE HEADING.
+
+*-----------------------------------------------------------------------
+* Title: Material-Vendor Overview (ALV Grid)
+* Description:
+*   - Selection criteria:
+*       S_MATNR: Material Number Range
+*       S_WERKS: Plant Range (Mandatory)
+*       S_LIFNR: Vendor Range
+*       S_MTART: Material Type
+*   - Output: ALV Grid supporting sorting, filtering, subtotalling,
+*             exporting (Excel/PDF), and layout saving.
+*   - Presentation: SAP GUI for Windows and SAP GUI for HTML (Fiori)
+*   - Technology: ALV Grid Control via CL_SALV_TABLE
+*-----------------------------------------------------------------------
+
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-t01.
+SELECT-OPTIONS:
+  s_matnr FOR mara-matnr,
+  s_werks FOR marc-werks OBLIGATORY,
+  s_lifnr FOR lfa1-lifnr,
+  s_mtart FOR mara-mtart.
+SELECTION-SCREEN END OF BLOCK b1.
+
+INITIALIZATION.
+  text-t01 = 'Selection Criteria'.
+
+*-----------------------------------------------------------------------
+* Types and Data Declarations
+*-----------------------------------------------------------------------
+TYPES: BEGIN OF ty_out,
+         matnr       TYPE mara-matnr,
+         maktx       TYPE makt-maktx,
+         werks       TYPE marc-werks,
+         werks_name  TYPE t001w-name1,
+         lifnr       TYPE lfa1-lifnr,
+         vendor_name TYPE lfa1-name1,
+         mtart       TYPE mara-mtart,
+         mtbez       TYPE t134t-mtbez,
+         meins       TYPE mara-meins,
+         matkl       TYPE mara-matkl,
+         ekorg       TYPE eine-ekorg,
+         netpr       TYPE eine-netpr,
+         waers       TYPE eine-waers,
+         peinh       TYPE eine-peinh,
+         cnt         TYPE i,
+       END OF ty_out.
+
+DATA: gt_out TYPE STANDARD TABLE OF ty_out WITH DEFAULT KEY.
+
+DATA: go_alv    TYPE REF TO cl_salv_table,
+      gr_cols   TYPE REF TO cl_salv_columns_table,
+      gr_funcs  TYPE REF TO cl_salv_functions_list,
+      gr_layout TYPE REF TO cl_salv_layout,
+      gr_aggr   TYPE REF TO cl_salv_aggregations,
+      gr_sorts  TYPE REF TO cl_salv_sorts.
+
+DATA: ls_lkey TYPE salv_s_layout_key.
+
+*-----------------------------------------------------------------------
+* Start-of-selection
+*-----------------------------------------------------------------------
+START-OF-SELECTION.
+  PERFORM get_data.
+  IF gt_out IS INITIAL.
+    MESSAGE 'No data found for given selection.' TYPE 'S' DISPLAY LIKE 'E'.
+    RETURN.
+  ENDIF.
+  PERFORM display_alv.
+
+*----------------------------------------------------------------------
+* Form GET_DATA
+* Purpose:
+*   Read materials by plant and enrich with descriptions, vendor and
+*   purchasing info (info record). Vendor filter is optional.
+*----------------------------------------------------------------------
+FORM get_data.
+  FREE gt_out.
+
+  SELECT
+    a~matnr,
+    t~maktx,
+    a~werks,
+    w~name1          AS werks_name,
+    v~lifnr,
+    v~name1          AS vendor_name,
+    m~mtart,
+    mt~mtbez,
+    m~meins,
+    m~matkl,
+    ne~ekorg,
+    ne~netpr,
+    ne~waers,
+    ne~peinh
+    FROM marc AS a
+      INNER JOIN mara  AS m   ON m~matnr = a~matnr
+      LEFT  OUTER JOIN makt  AS t   ON t~matnr = a~matnr
+                                   AND t~spras = @sy-langu
+      LEFT  OUTER JOIN t001w AS w   ON w~werks = a~werks
+      " EINA links material to vendor (info record general data)
+      LEFT  OUTER JOIN eina  AS na  ON na~matnr = a~matnr
+      " EINE holds org/plant-specific conditions via INFNR
+      LEFT  OUTER JOIN eine  AS ne  ON ne~infnr = na~infnr
+                                   AND ( ne~werks = a~werks OR ne~werks = '' )
+      LEFT  OUTER JOIN lfa1  AS v   ON v~lifnr = na~lifnr
+      LEFT  OUTER JOIN t134t AS mt  ON mt~mtart = m~mtart
+                                   AND mt~spras = @sy-langu
+    INTO CORRESPONDING FIELDS OF TABLE @gt_out
+    WHERE a~werks IN @s_werks
+      AND ( @s_matnr[] IS INITIAL OR a~matnr IN @s_matnr )
+      AND ( @s_mtart[] IS INITIAL OR m~mtart IN @s_mtart )
+      AND ( @s_lifnr[] IS INITIAL OR na~lifnr IN @s_lifnr ).
+
+  " Add helper count for subtotals/totals
+  LOOP AT gt_out ASSIGNING FIELD-SYMBOL(<ls_out>).
+    <ls_out>-cnt = 1.
+  ENDLOOP.
+
+ENDFORM.
+
+*----------------------------------------------------------------------
+* Form DISPLAY_ALV
+* Purpose:
+*   Build and show SALV table with functions, aggregations, sorts,
+*   and layout handling.
+*----------------------------------------------------------------------
+FORM display_alv.
+
+  TRY.
+      cl_salv_table=>factory(
+        IMPORTING
+          r_salv_table = go_alv
+        CHANGING
+          t_table      = gt_out ).
+    CATCH cx_salv_msg INTO DATA(lx_salv).
+      MESSAGE lx_salv->get_text( ) TYPE 'S' DISPLAY LIKE 'E'.
+      RETURN.
+  ENDTRY.
+
+  " Enable full function set (sort, filter, export, print, etc.)
+  gr_funcs = go_alv->get_functions( ).
+  gr_funcs->set_all( abap_true ).
+
+  " Optimize column widths
+  gr_cols = go_alv->get_columns( ).
+  gr_cols->set_optimize( abap_true ).
+
+  " Column texts and properties
+  PERFORM setup_columns.
+
+  " Aggregations (for subtotals/totals)
+  gr_aggr = go_alv->get_aggregations( ).
+  TRY.
+      gr_aggr->add_aggregation( 'CNT' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+  TRY.
+      gr_aggr->add_aggregation( 'NETPR' ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  " Default sorting with subtotals by Plant and Vendor
+  gr_sorts = go_alv->get_sorts( ).
+  TRY.
+      gr_sorts->add_sort( columnname = 'WERKS' subtotal = abap_true ).
+      gr_sorts->add_sort( columnname = 'LIFNR' subtotal = abap_true ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  " Layout variant handling (save per-user)
+  gr_layout = go_alv->get_layout( ).
+  ls_lkey-report = sy-repid.
+  gr_layout->set_key( ls_lkey ).
+  gr_layout->set_default( abap_true ).
+  gr_layout->set_save_restriction( if_salv_c_layout=>restrict_none ).
+
+  go_alv->display( ).
+
+ENDFORM.
+
+*----------------------------------------------------------------------
+* Form SETUP_COLUMNS
+* Purpose:
+*   Set column headers and technical properties.
+*----------------------------------------------------------------------
+FORM setup_columns.
+  DATA: lo_col TYPE REF TO cl_salv_column_table.
+
+  TRY.
+      lo_col = gr_cols->get_column( 'MATNR' ).
+      lo_col->set_long_text(   'Material' ).
+      lo_col->set_medium_text( 'Material' ).
+      lo_col->set_short_text(  'Material' ).
+
+      lo_col = gr_cols->get_column( 'MAKTX' ).
+      lo_col->set_long_text(   'Material Description' ).
+      lo_col->set_medium_text( 'Mat. Desc.' ).
+      lo_col->set_short_text(  'Desc' ).
+
+      lo_col = gr_cols->get_column( 'WERKS' ).
+      lo_col->set_long_text(   'Plant' ).
+      lo_col->set_medium_text( 'Plant' ).
+      lo_col->set_short_text(  'Plnt' ).
+
+      lo_col = gr_cols->get_column( 'WERKS_NAME' ).
+      lo_col->set_long_text(   'Plant Name' ).
+      lo_col->set_medium_text( 'Plant Name' ).
+      lo_col->set_short_text(  'Plt Name' ).
+
+      lo_col = gr_cols->get_column( 'LIFNR' ).
+      lo_col->set_long_text(   'Vendor' ).
+      lo_col->set_medium_text( 'Vendor' ).
+      lo_col->set_short_text(  'Vendor' ).
+
+      lo_col = gr_cols->get_column( 'VENDOR_NAME' ).
+      lo_col->set_long_text(   'Vendor Name' ).
+      lo_col->set_medium_text( 'Vendor Name' ).
+      lo_col->set_short_text(  'Vend Name' ).
+
+      lo_col = gr_cols->get_column( 'MTART' ).
+      lo_col->set_long_text(   'Material Type' ).
+      lo_col->set_medium_text( 'Mat. Type' ).
+      lo_col->set_short_text(  'Type' ).
+
+      lo_col = gr_cols->get_column( 'MTBEZ' ).
+      lo_col->set_long_text(   'Material Type Description' ).
+      lo_col->set_medium_text( 'Type Desc' ).
+      lo_col->set_short_text(  'Type Dsc' ).
+
+      lo_col = gr_cols->get_column( 'MEINS' ).
+      lo_col->set_long_text(   'Base Unit' ).
+      lo_col->set_medium_text( 'Base Unit' ).
+      lo_col->set_short_text(  'BUoM' ).
+
+      lo_col = gr_cols->get_column( 'MATKL' ).
+      lo_col->set_long_text(   'Material Group' ).
+      lo_col->set_medium_text( 'Mat. Group' ).
+      lo_col->set_short_text(  'MGrp' ).
+
+      lo_col = gr_cols->get_column( 'EKORG' ).
+      lo_col->set_long_text(   'Purchasing Organization' ).
+      lo_col->set_medium_text( 'Purch. Org' ).
+      lo_col->set_short_text(  'EKORG' ).
+
+      lo_col = gr_cols->get_column( 'NETPR' ).
+      lo_col->set_long_text(   'Net Price' ).
+      lo_col->set_medium_text( 'Net Price' ).
+      lo_col->set_short_text(  'Price' ).
+      TRY.
+          lo_col->set_currency_column( 'WAERS' ).
+        CATCH cx_salv_data_error.
+      ENDTRY.
+
+      lo_col = gr_cols->get_column( 'WAERS' ).
+      lo_col->set_long_text(   'Currency' ).
+      lo_col->set_medium_text( 'Currency' ).
+      lo_col->set_short_text(  'Curr' ).
+
+      lo_col = gr_cols->get_column( 'PEINH' ).
+      lo_col->set_long_text(   'Price Unit' ).
+      lo_col->set_medium_text( 'Price Unit' ).
+      lo_col->set_short_text(  'PUn' ).
+
+      lo_col = gr_cols->get_column( 'CNT' ).
+      lo_col->set_long_text(   'Count' ).
+      lo_col->set_medium_text( 'Count' ).
+      lo_col->set_short_text(  'Cnt' ).
+
+    CATCH cx_salv_not_found.
+      " Ignore missing columns
+  ENDTRY.
+
+ENDFORM.
+
+
+SECTION 2 - CUSTOM OBJECT DEFINITIONS
+No custom objects required for this development.
